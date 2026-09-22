@@ -292,6 +292,14 @@ public:
 	// Readback stage.
 	void flush_readback(const uint32_t *page_indices, uint32_t num_indices);
 
+	// G40 wall (env-gated PGS_G40_WALL; called only when enabled).
+	// Record GPU-side probe copies into the open direct command buffer,
+	// then map staging and hash bytes after the caller's submit+wait.
+	// Observation-only: transfer copies + barriers; texture layout restored.
+	bool g40_record_probes(const Vulkan::Image *tex_image, uint32_t tex_w, uint32_t tex_h);
+	bool g40_finish_probes(uint64_t &tex_fnv, uint32_t &tex_nz, uint8_t tex_head[8],
+	                       uint64_t &gpu_fnv, uint32_t &gpu_nz, uint8_t gpu_head[8]);
+
 	// Submit to GPU and signal when done.
 	void flush_submit(uint64_t timeline);
 
@@ -331,6 +339,12 @@ private:
 	Vulkan::CommandBufferHandle clear_cmd;
 	Vulkan::CommandBufferHandle heuristic_cmd;
 	Vulkan::CommandBufferHandle binning_cmd;
+	// G40 wall probe staging (one-shot per firing; reassigned only after GPU wait).
+	Vulkan::BufferHandle g40_tex_staging;
+	Vulkan::BufferHandle g40_gpu_staging;
+	uint32_t g40_tex_pw = 0;
+	uint32_t g40_tex_ph = 0;
+	bool g40_tex_pvalid = false;
 	uint32_t vram_size = 0;
 	uint32_t next_clut_instance = 0;
 	uint32_t base_clut_instance = 0;

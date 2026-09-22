@@ -1588,6 +1588,124 @@ void GSRenderer::flush_host_vram_copy(const uint32_t *block_indices, uint32_t nu
 	check_flush_stats();
 }
 
+static void g40_fnv_hash(const uint8_t *p, size_t n, uint64_t &fnv, uint32_t &nz, uint8_t head[8])
+{
+	fnv = 1469598103934665603ull; // G29-E1 truncated basis (comparability)
+	nz = 0;
+	for (size_t i = 0; i < n; i++)
+	{
+		fnv ^= p[i];
+		fnv *= 1099511628211ull;
+		nz += p[i] != 0;
+	}
+	for (unsigned i = 0; i < 8 && i < n; i++)
+		head[i] = p[i];
+}
+
+bool GSRenderer::g40_record_probes(const Vulkan::Image *tex_image, uint32_t tex_w, uint32_t tex_h)
+{
+	if (!device || !direct_cmd)
+		return false;
+	auto &cmd = *direct_cmd;
+	g40_tex_pvalid = false;
+	g40_tex_pw = 0;
+	g40_tex_ph = 0;
+
+	// Order vs all prior storage/transfer writes (shading wrote gpu-B earlier in this stream).
+	cmd.barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+	            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
+	            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+
+	// Probe 1: gpu-side B pages (112..223) -> staging.
+	{
+		Vulkan::BufferCreateInfo info = {};
+		info.size = VkDeviceSize(112) * VkDeviceSize(PageSize);
+		info.domain = Vulkan::BufferDomain::CachedHost;
+		info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+		g40_gpu_staging = device->create_buffer(info);
+		if (!g40_gpu_staging)
+			return false;
+		// NOTE: not copy_blocks (it copies VRAM offset -> same offset, but the
+		// staging buffer is compact: B pages land at staging offset 0).
+		cmd.begin_region("g40-gpuB");
+		cmd.copy_buffer(*g40_gpu_staging, 0, *buffers.gpu,
+		                VkDeviceSize(112) * VkDeviceSize(PageSize),
+		                VkDeviceSize(112) * VkDeviceSize(PageSize));
+		cmd.end_region();
+	}
+
+	// Probe 2: composite texture image (level/layer 0) -> staging.
+	if (tex_image && tex_w && tex_h)
+	{
+		VkDeviceSize n = VkDeviceSize(tex_w) * VkDeviceSize(tex_h) * 4;
+		Vulkan::BufferCreateInfo info = {};
+		info.size = n;
+		info.domain = Vulkan::BufferDomain::CachedHost;
+		info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+		g40_tex_staging = device->create_buffer(info);
+		if (!g40_tex_staging)
+			return false;
+		cmd.begin_region("g40-tex");
+		cmd.image_barrier(*tex_image, VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		                  VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+		                  VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+		VkImageSubresourceLayers sub = {};
+		sub.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		sub.mipLevel = 0;
+		sub.baseArrayLayer = 0;
+		sub.layerCount = 1;
+		VkOffset3D off = {};
+		VkExtent3D ext = { tex_w, tex_h, 1 };
+		cmd.copy_image_to_buffer(*g40_tex_staging, *tex_image, 0, off, ext, 0, 0, sub);
+		cmd.image_barrier(*tex_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL,
+		                  VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+		                  VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+		cmd.end_region();
+		g40_tex_pw = tex_w;
+		g40_tex_ph = tex_h;
+		g40_tex_pvalid = true;
+	}
+
+	// Make staging writes visible to host reads after the wait.
+	cmd.barrier(VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+	            VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
+	return true;
+}
+
+bool GSRenderer::g40_finish_probes(uint64_t &tex_fnv, uint32_t &tex_nz, uint8_t tex_head[8],
+                                   uint64_t &gpu_fnv, uint32_t &gpu_nz, uint8_t gpu_head[8])
+{
+	tex_fnv = 0;
+	tex_nz = 0;
+	gpu_fnv = 0;
+	gpu_nz = 0;
+	for (unsigned i = 0; i < 8; i++)
+		tex_head[i] = gpu_head[i] = 0;
+	if (!device || !g40_gpu_staging)
+	{
+		LOGE("G40: gpu staging missing.\n");
+		return false;
+	}
+	auto *gpu = static_cast<const uint8_t *>(device->map_host_buffer(*g40_gpu_staging, Vulkan::MEMORY_ACCESS_READ_BIT));
+	if (!gpu)
+	{
+		LOGE("G40: gpu staging map failed.\n");
+		return false;
+	}
+	g40_fnv_hash(gpu, size_t(112) * PageSize, gpu_fnv, gpu_nz, gpu_head);
+	if (g40_tex_pvalid && g40_tex_staging)
+	{
+		auto *tex = static_cast<const uint8_t *>(device->map_host_buffer(*g40_tex_staging, Vulkan::MEMORY_ACCESS_READ_BIT));
+		if (!tex)
+		{
+			LOGE("G40: tex staging map failed.\n");
+			return false;
+		}
+		g40_fnv_hash(tex, size_t(g40_tex_pw) * size_t(g40_tex_ph) * 4, tex_fnv, tex_nz, tex_head);
+	}
+	return true;
+}
+
 void GSRenderer::flush_readback(const uint32_t *page_indices, uint32_t num_indices)
 {
 	if (buffers.gpu == buffers.cpu)
@@ -3485,6 +3603,21 @@ uint32_t GSRenderer::update_palette_cache(const PaletteUploadDescriptor &desc)
 
 void GSRenderer::dispatch_texture_analysis(Vulkan::CommandBuffer &cmd, const RenderPass &rp)
 {
+	// G22 local workaround (not upstream): skip the sampler_feedback
+	// dispatch entirely when PGS_SKIP_SAMPLER_FEEDBACK=1. The per-texture
+	// indirect-dispatch args stay at their qword-cleared zeros, so the
+	// consuming upload dispatches launch zero workgroups: in-bounds, no
+	// new hazards, rendering delta only (sparse-uploaded texels missing).
+	static bool skip_sampler_feedback = [] {
+		const char *env = getenv("PGS_SKIP_SAMPLER_FEEDBACK");
+		bool skip = env && strcmp(env, "1") == 0;
+		if (skip)
+			LOGI("G22: skipping sampler_feedback dispatch (workaround).\n");
+		return skip;
+	}();
+	if (skip_sampler_feedback)
+		return;
+
 	cmd.set_program(shaders.sampler_feedback);
 	memcpy(cmd.allocate_typed_constant_data<TextureAnalysis>(1, 0, texture_analysis.size()),
 	       texture_analysis.data(),
