@@ -93,9 +93,15 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 
 	bool use_rdoc = Device::init_renderdoc_capture();
+	// G26 local narrowing (not upstream): deliver ONLY disable_sampler_feedback;
+	// force feedback_render_target back to the interface default (false) so the
+	// G24 ride-along is removed. Field surgery on the parsed struct: every other
+	// parsed field passes through unchanged, one variable vs G24.
+	debug_mode.feedback_render_target = false;
+	iface.set_debug_mode(debug_mode);
+	LOGI("G26: debug_mode delivered (disable_sampler_feedback=%d, feedback_render_target=%d, use_rdoc=%d).\n", int(debug_mode.disable_sampler_feedback), int(debug_mode.feedback_render_target), int(use_rdoc));
 	if (use_rdoc)
 	{
-		iface.set_debug_mode(debug_mode);
 		device.begin_renderdoc_capture();
 	}
 
