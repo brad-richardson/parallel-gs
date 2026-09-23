@@ -50,7 +50,13 @@ else()
     set(GRANITE_VULKAN_SYSTEM_HANDLES ON CACHE BOOL "" FORCE)
     set(GRANITE_SHADER_COMPILER_OPTIMIZE ON CACHE BOOL "" FORCE)
     set(GRANITE_SHIPPING OFF CACHE BOOL "" FORCE)
-    set(GRANITE_PLATFORM "SDL" CACHE STRING "" FORCE)
+    # G14 local experiment shim (not upstream): offline tools need no window
+    # system; null avoids the Android GameActivity path (no AGDK on host).
+    if (ANDROID)
+        set(GRANITE_PLATFORM "null" CACHE STRING "" FORCE)
+    else()
+        set(GRANITE_PLATFORM "SDL" CACHE STRING "" FORCE)
+    endif()
 endif()
 
 add_subdirectory(Granite EXCLUDE_FROM_ALL)

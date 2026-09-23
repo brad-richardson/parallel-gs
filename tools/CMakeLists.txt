@@ -5,6 +5,11 @@
 
 add_granite_offline_tool(parallel-gs-replayer gs_dump_replayer.cpp)
 target_link_libraries(parallel-gs-replayer PRIVATE parallel-gs parallel-gs-dump)
+# G14 local experiment shim (not upstream): Granite logging on Android uses
+# __android_log_print (logcat tag "Granite"); link liblog.
+if (ANDROID)
+    target_link_libraries(parallel-gs-replayer PRIVATE log)
+endif()
 
 add_granite_application(parallel-gs-stream gs_stream_replayer.cpp)
 target_link_libraries(parallel-gs-stream PRIVATE parallel-gs parallel-gs-dump analog-video)
