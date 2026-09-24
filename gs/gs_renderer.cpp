@@ -2112,6 +2112,16 @@ void GSRenderer::set_hierarchical_binning_subgroup_config(Vulkan::CommandBuffer 
 		size_log2--;
 	}
 
+	// No exact small wave (e.g. Adreno, whose minimum is 64). Prefer a fixed wave64:
+	// on Turnip/Adreno the free 4..128 range behaves like a required wave128, and the
+	// hierarchical binner then mis-bins (N8X1: black tiles, run-to-run variance).
+	if (device->supports_subgroup_size_log2(true, 6, 6))
+	{
+		cmd.set_subgroup_size_log2(true, 6, 6);
+		cmd.set_specialization_constant(0, std::min<uint32_t>(subgroup_size, 64u) * hier_factor * hier_factor);
+		return;
+	}
+
 	// Fallback case, allow whatever.
 	cmd.set_subgroup_size_log2(true, 2, 7);
 	cmd.set_specialization_constant(0, subgroup_size * hier_factor * hier_factor);
