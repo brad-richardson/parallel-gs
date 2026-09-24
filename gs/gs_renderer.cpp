@@ -1588,6 +1588,124 @@ void GSRenderer::flush_host_vram_copy(const uint32_t *block_indices, uint32_t nu
 	check_flush_stats();
 }
 
+static void g40_fnv_hash(const uint8_t *p, size_t n, uint64_t &fnv, uint32_t &nz, uint8_t head[8])
+{
+	fnv = 1469598103934665603ull; // G29-E1 truncated basis (comparability)
+	nz = 0;
+	for (size_t i = 0; i < n; i++)
+	{
+		fnv ^= p[i];
+		fnv *= 1099511628211ull;
+		nz += p[i] != 0;
+	}
+	for (unsigned i = 0; i < 8 && i < n; i++)
+		head[i] = p[i];
+}
+
+bool GSRenderer::g40_record_probes(const Vulkan::Image *tex_image, uint32_t tex_w, uint32_t tex_h)
+{
+	if (!device || !direct_cmd)
+		return false;
+	auto &cmd = *direct_cmd;
+	g40_tex_pvalid = false;
+	g40_tex_pw = 0;
+	g40_tex_ph = 0;
+
+	// Order vs all prior storage/transfer writes (shading wrote gpu-B earlier in this stream).
+	cmd.barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+	            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
+	            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+
+	// Probe 1: gpu-side B pages (112..223) -> staging.
+	{
+		Vulkan::BufferCreateInfo info = {};
+		info.size = VkDeviceSize(112) * VkDeviceSize(PageSize);
+		info.domain = Vulkan::BufferDomain::CachedHost;
+		info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+		g40_gpu_staging = device->create_buffer(info);
+		if (!g40_gpu_staging)
+			return false;
+		// NOTE: not copy_blocks (it copies VRAM offset -> same offset, but the
+		// staging buffer is compact: B pages land at staging offset 0).
+		cmd.begin_region("g40-gpuB");
+		cmd.copy_buffer(*g40_gpu_staging, 0, *buffers.gpu,
+		                VkDeviceSize(112) * VkDeviceSize(PageSize),
+		                VkDeviceSize(112) * VkDeviceSize(PageSize));
+		cmd.end_region();
+	}
+
+	// Probe 2: composite texture image (level/layer 0) -> staging.
+	if (tex_image && tex_w && tex_h)
+	{
+		VkDeviceSize n = VkDeviceSize(tex_w) * VkDeviceSize(tex_h) * 4;
+		Vulkan::BufferCreateInfo info = {};
+		info.size = n;
+		info.domain = Vulkan::BufferDomain::CachedHost;
+		info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+		g40_tex_staging = device->create_buffer(info);
+		if (!g40_tex_staging)
+			return false;
+		cmd.begin_region("g40-tex");
+		cmd.image_barrier(*tex_image, VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		                  VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+		                  VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+		VkImageSubresourceLayers sub = {};
+		sub.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		sub.mipLevel = 0;
+		sub.baseArrayLayer = 0;
+		sub.layerCount = 1;
+		VkOffset3D off = {};
+		VkExtent3D ext = { tex_w, tex_h, 1 };
+		cmd.copy_image_to_buffer(*g40_tex_staging, *tex_image, 0, off, ext, 0, 0, sub);
+		cmd.image_barrier(*tex_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL,
+		                  VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+		                  VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+		cmd.end_region();
+		g40_tex_pw = tex_w;
+		g40_tex_ph = tex_h;
+		g40_tex_pvalid = true;
+	}
+
+	// Make staging writes visible to host reads after the wait.
+	cmd.barrier(VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+	            VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
+	return true;
+}
+
+bool GSRenderer::g40_finish_probes(uint64_t &tex_fnv, uint32_t &tex_nz, uint8_t tex_head[8],
+                                   uint64_t &gpu_fnv, uint32_t &gpu_nz, uint8_t gpu_head[8])
+{
+	tex_fnv = 0;
+	tex_nz = 0;
+	gpu_fnv = 0;
+	gpu_nz = 0;
+	for (unsigned i = 0; i < 8; i++)
+		tex_head[i] = gpu_head[i] = 0;
+	if (!device || !g40_gpu_staging)
+	{
+		LOGE("G40: gpu staging missing.\n");
+		return false;
+	}
+	auto *gpu = static_cast<const uint8_t *>(device->map_host_buffer(*g40_gpu_staging, Vulkan::MEMORY_ACCESS_READ_BIT));
+	if (!gpu)
+	{
+		LOGE("G40: gpu staging map failed.\n");
+		return false;
+	}
+	g40_fnv_hash(gpu, size_t(112) * PageSize, gpu_fnv, gpu_nz, gpu_head);
+	if (g40_tex_pvalid && g40_tex_staging)
+	{
+		auto *tex = static_cast<const uint8_t *>(device->map_host_buffer(*g40_tex_staging, Vulkan::MEMORY_ACCESS_READ_BIT));
+		if (!tex)
+		{
+			LOGE("G40: tex staging map failed.\n");
+			return false;
+		}
+		g40_fnv_hash(tex, size_t(g40_tex_pw) * size_t(g40_tex_ph) * 4, tex_fnv, tex_nz, tex_head);
+	}
+	return true;
+}
+
 void GSRenderer::flush_readback(const uint32_t *page_indices, uint32_t num_indices)
 {
 	if (buffers.gpu == buffers.cpu)
@@ -3495,6 +3613,21 @@ uint32_t GSRenderer::update_palette_cache(const PaletteUploadDescriptor &desc)
 
 void GSRenderer::dispatch_texture_analysis(Vulkan::CommandBuffer &cmd, const RenderPass &rp)
 {
+	// G22 local workaround (not upstream): skip the sampler_feedback
+	// dispatch entirely when PGS_SKIP_SAMPLER_FEEDBACK=1. The per-texture
+	// indirect-dispatch args stay at their qword-cleared zeros, so the
+	// consuming upload dispatches launch zero workgroups: in-bounds, no
+	// new hazards, rendering delta only (sparse-uploaded texels missing).
+	static bool skip_sampler_feedback = [] {
+		const char *env = getenv("PGS_SKIP_SAMPLER_FEEDBACK");
+		bool skip = env && strcmp(env, "1") == 0;
+		if (skip)
+			LOGI("G22: skipping sampler_feedback dispatch (workaround).\n");
+		return skip;
+	}();
+	if (skip_sampler_feedback)
+		return;
+
 	cmd.set_program(shaders.sampler_feedback);
 	memcpy(cmd.allocate_typed_constant_data<TextureAnalysis>(1, 0, texture_analysis.size()),
 	       texture_analysis.data(),
@@ -4632,6 +4765,9 @@ ScanoutResult GSRenderer::vsync(const PrivRegisterState &priv, const VSyncInfo &
 		}
 	}
 
+	ScanoutResult selected_capture = {};
+	if (info.capture_selected_input)
+		selected_capture.selected_capture_status = 1;
 	if (EN1)
 	{
 		if (device->consumes_debug_markers())
@@ -4648,6 +4784,52 @@ ScanoutResult GSRenderer::vsync(const PrivRegisterState &priv, const VSyncInfo &
 		}
 
 		auto rect = compute_circuit_rect(priv, phase, priv.display1, force_progressive, promoted1);
+		if (info.capture_selected_input)
+		{
+			selected_capture.selected_fbp = uint32_t(priv.dispfb1.FBP);
+			selected_capture.selected_fbw = uint32_t(priv.dispfb1.FBW);
+			selected_capture.selected_psm = uint32_t(priv.dispfb1.PSM);
+			selected_capture.selected_dbx = uint32_t(priv.dispfb1.DBX);
+			selected_capture.selected_dby = uint32_t(priv.dispfb1.DBY);
+			selected_capture.selected_phase = rect.phase_offset;
+			selected_capture.selected_stride = rect.phase_stride;
+			selected_capture.selected_mask = vram_size - 1;
+			selected_capture.selected_samples = super_samples;
+			selected_capture.selected_promoted = promoted1 != nullptr;
+			selected_capture.selected_width = rect.image_extent.width;
+			selected_capture.selected_height = rect.image_extent.height;
+			selected_capture.selected_valid_width = rect.valid_extent.width;
+			selected_capture.selected_valid_height = rect.valid_extent.height;
+			const bool supported_psm = selected_capture.selected_psm == PSMCT32 ||
+				selected_capture.selected_psm == PSMCT24 || selected_capture.selected_psm == PSMCT16 ||
+				selected_capture.selected_psm == PSMCT16S || selected_capture.selected_psm == PSMZ32 ||
+				selected_capture.selected_psm == PSMZ24 || selected_capture.selected_psm == PSMZ16 ||
+				selected_capture.selected_psm == PSMZ16S;
+			const uint64_t last_y = uint64_t(selected_capture.selected_dby) + rect.phase_offset +
+				uint64_t(223) * rect.phase_stride;
+			if (!promoted1 && super_samples == 1 && vram_size == 4u * 1024u * 1024u &&
+			    supported_psm && rect.image_extent.width == 512 && rect.image_extent.height == 224 &&
+			    rect.valid_extent.width == 512 && rect.valid_extent.height == 224 &&
+			    selected_capture.selected_fbw && rect.phase_stride &&
+			    uint64_t(selected_capture.selected_dbx) + 511 < 2048 && last_y < 2048)
+			{
+				Vulkan::BufferCreateInfo staging_info = {};
+				staging_info.size = 4u * 1024u * 1024u;
+				staging_info.domain = Vulkan::BufferDomain::CachedHost;
+				staging_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+				selected_capture.selected_vram_staging = device->create_buffer(staging_info);
+				if (selected_capture.selected_vram_staging)
+				{
+					cmd.barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+					            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
+					            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+					cmd.copy_buffer(*selected_capture.selected_vram_staging, 0, *buffers.gpu, 0,
+					                4u * 1024u * 1024u);
+					cmd.barrier(VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+					            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+				}
+			}
+		}
 		image_info.width = rect.image_extent.width;
 		image_info.height = rect.image_extent.height;
 
@@ -4807,7 +4989,9 @@ ScanoutResult GSRenderer::vsync(const PrivRegisterState &priv, const VSyncInfo &
 		}
 	}
 
-	ScanoutResult result = {};
+	ScanoutResult result = std::move(selected_capture);
+	if (info.capture_scanout_stages)
+		result.circuit1 = circuit1;
 	result.mode_width = mode_width;
 	result.mode_height = mode_height;
 	result.high_resolution_scanout = high_resolution_scanout;
@@ -4877,6 +5061,31 @@ ScanoutResult GSRenderer::vsync(const PrivRegisterState &priv, const VSyncInfo &
 		                  VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL,
 		                  VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 		                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+		if (info.capture_selected_input && result.selected_vram_staging)
+		{
+			Vulkan::BufferCreateInfo staging_info = {};
+			staging_info.size = 512u * 224u * 4u;
+			staging_info.domain = Vulkan::BufferDomain::CachedHost;
+			staging_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+			result.circuit1_staging = device->create_buffer(staging_info);
+			if (result.circuit1_staging)
+			{
+				cmd.image_barrier(*circuit1, VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL,
+				                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+				                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+				                  VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+				cmd.copy_image_to_buffer(*result.circuit1_staging, *circuit1, 0, {},
+				                         {512u, 224u, 1u}, 0, 0,
+				                         {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1});
+				cmd.image_barrier(*circuit1, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+				                  VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL,
+				                  VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+				                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+				cmd.barrier(VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+				            VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
+				result.selected_capture_status = 2;
+			}
+		}
 	}
 
 	if (circuit2)
@@ -5112,6 +5321,8 @@ ScanoutResult GSRenderer::vsync(const PrivRegisterState &priv, const VSyncInfo &
 	}
 
 	bool should_deinterlace = !high_resolution_scanout && (is_interlaced || force_deinterlace);
+	if (info.capture_scanout_stages)
+		result.pre_deinterlace_merged = merged;
 
 	if (!info.skip_deinterlace && should_deinterlace)
 	{

@@ -9,9 +9,108 @@
 #include "shaders/swizzle_utils.h"
 #include "muglm/muglm_impl.hpp"
 #include "gs_registers_debug.hpp"
+#include <cstdlib> // G40: std::getenv
 
 namespace ParallelGS
 {
+// G40 local diagnostic (not upstream): sub-vsync A->B observation wall at
+// boundary 1 (composite-flush ordinal 1 == pass 0, vsync #1, phase 0).
+// Env-gated (PGS_G40_WALL=1), default silent, observation-only: kick/tex
+// counters + LOGI + VRAM/staging reads + ONE forced submit+wait per probe
+// firing (composite ordinals {0,1}; ordinal 0 is the load-control).
+// Unset: one cached getenv branch per hook, zero lines, zero submits.
+static bool g40_enabled()
+{
+	static bool en = std::getenv("PGS_G40_WALL") != nullptr;
+	return en;
+}
+static unsigned g40_next_flush_ord = 0;
+static unsigned g40_next_comp_ord = 0;
+static bool g40_busy = false;
+static unsigned g40_k_seen = 0;
+static unsigned g40_k_adc = 0;
+static unsigned g40_k_deg = 0;
+static unsigned g40_k_bb = 0;
+static unsigned g40_k_fuse = 0;
+static unsigned g40_k_acc = 0;
+static unsigned g40_tex_reuse = 0;
+static bool g40_tex_created = false;
+static uint64_t g40_tex_hash = 0;
+static unsigned g40_tex_tbp0 = 0;
+static unsigned g40_tex_tbw = 0;
+static unsigned g40_tex_psm = 0;
+static unsigned g40_tex_levels = 0;
+static unsigned g40_tex_samples = 0;
+static bool g40_tex_longterm = false;
+static bool g40_last_valid = false;
+static unsigned g40_last_ford = 0;
+static uint64_t g40_last_f = 0;
+static uint32_t g40_last_z = 0;
+static uint8_t g40_last_head[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+static void g40_fnv(const uint8_t *p, size_t n, uint64_t &fnv, uint32_t &nz)
+{
+	fnv = 1469598103934665603ull; // G29-E1 truncated basis (comparability)
+	nz = 0;
+	for (size_t i = 0; i < n; i++)
+	{
+		fnv ^= p[i];
+		fnv *= 1099511628211ull;
+		nz += p[i] != 0;
+	}
+}
+static const char *g40_reason_str(FlushReason r)
+{
+	switch (r)
+	{
+	case FlushReason::FBPointer:
+		return "FBPointer";
+	case FlushReason::Overflow:
+		return "Overflow";
+	case FlushReason::TextureHazard:
+		return "TextureHazard";
+	case FlushReason::CopyHazard:
+		return "CopyHazard";
+	case FlushReason::SubmissionFlush:
+		return "SubmissionFlush";
+	case FlushReason::PressureFlush:
+		return "PressureFlush";
+	case FlushReason::HostAccess:
+		return "HostAccess";
+	default:
+		return "?";
+	}
+}
+// G41 local diagnostic (not upstream): masked-write canary at boundary 1
+// (composite-flush ordinal 1) + per-flush instance census (scratch-overlap
+// proof) + O4m hash-input breakdown. Env-gated (PGS_G41_CANARY=1), default
+// silent. The canary kicks small synthetic sprites into scratch VRAM pages
+// (492..511, never B) through the live draw path, reads the arena back
+// after a forced submit+wait, then RESTORES the saved bytes, so the game
+// observes zero perturbation (G31 / G30-vpage / scanouts expected 0-diff).
+static bool g41_enabled()
+{
+	static bool en = std::getenv("PGS_G41_CANARY") != nullptr;
+	return en;
+}
+static unsigned g41_next_ford = 0;
+static unsigned g41_next_comp_ord = 0;
+static bool g41_busy = false;
+enum { G41_ARENA_BASE_PAGE = 492, G41_ARENA_NPAGES = 20 };
+static void g41_fnv(const uint8_t *p, size_t n, uint64_t &fnv, uint32_t &nz)
+{
+	fnv = 1469598103934665603ull; // G29-E1 truncated basis (comparability)
+	nz = 0;
+	for (size_t i = 0; i < n; i++)
+	{
+		fnv ^= p[i];
+		fnv *= 1099511628211ull;
+		nz += p[i] != 0;
+	}
+}
+// G41-R1: kick-time composite register snapshot (C5 replays the composite's
+// exact draw state; live regs at flush-end already belong to the next pass).
+static RegisterState g41_snap_regs = {};
+static bool g41_snap_valid = false;
 GSInterface::GSInterface()
 	: tracker(*this), renderer(tracker)
 {
@@ -132,6 +231,112 @@ static bool write_mask_is_16bit_channel_slice(uint32_t psm, uint32_t color_mask)
 
 void GSInterface::flush_render_pass(FlushReason reason)
 {
+	// G40 wall entry: snapshot only (no map: a pre-read would recurse into
+	// mark_submission_timeline and consume the pending prims in an inner
+	// flush. O2 pre-bytes come from the O2x post-flush chain, see end.).
+	// Inner (recursive) calls see g40_busy and skip all G40 work.
+	bool g40_outer = !g40_busy && g40_enabled();
+	unsigned g40_ford = 0;
+	bool g40_is_comp = false;
+	int g40_cord = -1;
+	unsigned g40_entry_prims = 0;
+	Vulkan::ImageHandle g40_tex_hold;
+	uint32_t g40_tex_w = 0;
+	uint32_t g40_tex_h = 0;
+	if (g40_outer)
+	{
+		g40_ford = g40_next_flush_ord++;
+		g40_entry_prims = render_pass.primitive_count;
+		if (render_pass.primitive_count)
+		{
+			for (uint32_t g40_i = 0; g40_i < render_pass.num_instances; g40_i++)
+			{
+				if (render_pass.instances[g40_i].frame.desc.FBP == 112)
+					g40_is_comp = true;
+			}
+		}
+		if (g40_is_comp)
+		{
+			g40_busy = true;
+			g40_cord = int(g40_next_comp_ord++);
+			if (!render_pass.held_images.empty() && !render_pass.tex_infos.empty() && render_pass.held_images[0])
+			{
+				g40_tex_hold = render_pass.held_images[0];
+				g40_tex_w = render_pass.held_images[0]->get_width();
+				g40_tex_h = render_pass.held_images[0]->get_height();
+			}
+		}
+	}
+	// G41 entry: independent composite ordinal + per-flush instance census
+	// (FRAME+Z identity, bb page spans, scratch-arena overlap flags).
+	// Inner (recursive) calls see g41_busy and skip all G41 work.
+	bool g41_outer = !g41_busy && g41_enabled();
+	bool g41_is_comp = false;
+	int g41_cord = -1;
+	unsigned g41_ford = 0;
+	unsigned g41_entry_prims = 0;
+	bool g41_has_texinfo = false;
+	TexInfo g41_texinfo = {};
+	unsigned g41_tex_count = 0;
+	if (g41_outer)
+	{
+		g41_ford = g41_next_ford++;
+		g41_entry_prims = render_pass.primitive_count;
+		if (render_pass.primitive_count)
+		{
+			for (uint32_t g41_i = 0; g41_i < render_pass.num_instances; g41_i++)
+			{
+				if (render_pass.instances[g41_i].frame.desc.FBP == 112)
+					g41_is_comp = true;
+			}
+			for (uint32_t g41_i = 0; g41_i < render_pass.num_instances; g41_i++)
+			{
+				const auto &g41_inst = render_pass.instances[g41_i];
+				if (g41_inst.bb.z < 0 || g41_inst.bb.w < 0)
+					continue;
+				int g41_bx0 = g41_inst.bb.x < 0 ? 0 : g41_inst.bb.x;
+				int g41_by0 = g41_inst.bb.y < 0 ? 0 : g41_inst.bb.y;
+				int g41_bx1 = g41_inst.bb.z < 0 ? 0 : g41_inst.bb.z;
+				int g41_by1 = g41_inst.bb.w < 0 ? 0 : g41_inst.bb.w;
+				unsigned g41_fbp = g41_inst.frame.desc.FBP;
+				unsigned g41_fbw = g41_inst.frame.desc.FBW;
+				unsigned g41_stride = g41_fbw ? g41_fbw : 1;
+				unsigned g41_flo = g41_fbp + unsigned(g41_bx0 >> int(g41_inst.fb_page_width_log2)) +
+				                   unsigned(g41_by0 >> int(g41_inst.fb_page_height_log2)) * g41_stride;
+				unsigned g41_fhi = g41_fbp + unsigned(g41_bx1 >> int(g41_inst.fb_page_width_log2)) +
+				                   unsigned(g41_by1 >> int(g41_inst.fb_page_height_log2)) * g41_stride;
+				unsigned g41_zbp = g41_inst.zbuf.desc.ZBP;
+				unsigned g41_zlo = g41_zbp + unsigned(g41_bx0 >> int(g41_inst.z_page_width_log2)) +
+				                   unsigned(g41_by0 >> int(g41_inst.z_page_height_log2)) * g41_stride;
+				unsigned g41_zhi = g41_zbp + unsigned(g41_bx1 >> int(g41_inst.z_page_width_log2)) +
+				                   unsigned(g41_by1 >> int(g41_inst.z_page_height_log2)) * g41_stride;
+				unsigned g41_fov = (g41_flo < 512 && g41_fhi >= 492) ? 1 : 0;
+				unsigned g41_zov = (g41_inst.z_write && g41_zlo < 512 && g41_zhi >= 492) ? 1 : 0;
+				LOGI("G41: census ford=%u prims=%u inst=%u/%u FBP=%u FBW=%u PSM=%u MSK=%08x ZBP=%u ZPSM=%u ZMSK=%u zwr=%u zsen=%u cwm=%08x bb=%d,%d,%d,%d fpg=%u..%u zpg=%u..%u fov=%u zov=%u reason=%s.\n",
+				     g41_ford, g41_entry_prims, g41_i, render_pass.num_instances,
+				     g41_fbp, g41_fbw, (unsigned)g41_inst.frame.desc.PSM,
+				     (unsigned)g41_inst.frame.desc.FBMSK,
+				     g41_zbp, (unsigned)g41_inst.zbuf.desc.PSM,
+				     (unsigned)g41_inst.zbuf.desc.ZMSK,
+				     (unsigned)g41_inst.z_write, (unsigned)g41_inst.z_sensitive,
+				     (unsigned)g41_inst.color_write_mask,
+				     g41_inst.bb.x, g41_inst.bb.y, g41_inst.bb.z, g41_inst.bb.w,
+				     g41_flo, g41_fhi, g41_zlo, g41_zhi, g41_fov, g41_zov,
+				     g40_reason_str(reason));
+			}
+		}
+		if (g41_is_comp)
+		{
+			g41_busy = true;
+			g41_cord = int(g41_next_comp_ord++);
+			if (!render_pass.tex_infos.empty())
+			{
+				g41_texinfo = render_pass.tex_infos[0].info;
+				g41_has_texinfo = true;
+				g41_tex_count = (unsigned)render_pass.tex_infos.size();
+			}
+		}
+	}
 	ParallelGS::RenderPass rp = {};
 
 	if (render_pass.primitive_count)
@@ -298,6 +503,22 @@ void GSInterface::flush_render_pass(FlushReason reason)
 		rp.flush_reason = reason;
 		//////
 
+		{
+			// G11b local experiment hook (not upstream): recorded-batch identity.
+			LOGI("G11: record prims=%u inst=%u tex=%u tex0=%u\n", rp.num_primitives,
+			     rp.num_instances, rp.num_textures, (unsigned)render_pass.tex0_infos.size());
+			for (uint32_t g11_i = 0; g11_i < rp.num_instances; g11_i++)
+				LOGI("G11:   inst %u FRAME FBP=%u FBW=%u PSM=%u\n", g11_i,
+				     (unsigned)rp.instances[g11_i].fb.frame.desc.FBP,
+				     (unsigned)rp.instances[g11_i].fb.frame.desc.FBW,
+				     (unsigned)rp.instances[g11_i].fb.frame.desc.PSM);
+			for (uint32_t g11_j = 0; g11_j < render_pass.tex0_infos.size(); g11_j++)
+				LOGI("G11:   tex %u TBP0=%u TBW=%u TPSM=%u CBP=%u\n", g11_j,
+				     (unsigned)render_pass.tex0_infos[g11_j].TBP0,
+				     (unsigned)render_pass.tex0_infos[g11_j].TBW,
+				     (unsigned)render_pass.tex0_infos[g11_j].PSM,
+				     (unsigned)render_pass.tex0_infos[g11_j].CBP);
+		}
 		renderer.flush_rendering(rp);
 
 		// Need to call this after flush rendering to ensure that the images
@@ -348,6 +569,612 @@ void GSInterface::flush_render_pass(FlushReason reason)
 	render_pass.positions = renderer.get_reserved_vertex_positions();
 	render_pass.attributes = renderer.get_reserved_vertex_attributes();
 	render_pass.prim = renderer.get_reserved_primitive_attributes();
+	if (g40_outer) // G40 wall end: O1/O5/O4m every flush, O3/O3b/O4 at cord {0,1}
+	{
+		LOGI("G40: O1 ford=%u cord=%d prims=%u submitted=%u inst=%u tex=%u seen=%u adc=%u deg=%u bb=%u fuse=%u acc=%u.\n",
+		     g40_ford, g40_cord, g40_entry_prims, (unsigned)rp.num_primitives,
+		     (unsigned)rp.num_instances, (unsigned)rp.num_textures,
+		     g40_k_seen, g40_k_adc, g40_k_deg, g40_k_bb, g40_k_fuse, g40_k_acc);
+		g40_k_seen = 0;
+		g40_k_adc = 0;
+		g40_k_deg = 0;
+		g40_k_bb = 0;
+		g40_k_fuse = 0;
+		g40_k_acc = 0;
+		if (g40_is_comp)
+		{
+			LOGI("G40: O5 ford=%u cord=%d reason=%s label=%u states=%u tex=%u fbmode=%u tilelog2=%u.\n",
+			     g40_ford, g40_cord, g40_reason_str(reason), (unsigned)rp.label_key,
+			     (unsigned)rp.num_states, (unsigned)rp.num_textures, (unsigned)rp.feedback_mode,
+			     (unsigned)rp.coarse_tile_size_log2);
+			for (uint32_t g40_i = 0; g40_i < rp.num_instances; g40_i++)
+			{
+				LOGI("G40: O5 ford=%u cord=%d inst=%u FBP=%u FBW=%u PSM=%u FBMSK=%08x ZBP=%u ZMSK=%u opq=%08x chshuf=%u zsens=%u zwr=%u ssx=%u ssy=%u base=%u,%u ctiles=%ux%u.\n",
+				     g40_ford, g40_cord, g40_i,
+				     (unsigned)rp.instances[g40_i].fb.frame.desc.FBP,
+				     (unsigned)rp.instances[g40_i].fb.frame.desc.FBW,
+				     (unsigned)rp.instances[g40_i].fb.frame.desc.PSM,
+				     (unsigned)rp.instances[g40_i].fb.frame.desc.FBMSK,
+				     (unsigned)rp.instances[g40_i].fb.z.desc.ZBP,
+				     (unsigned)rp.instances[g40_i].fb.z.desc.ZMSK,
+				     (unsigned)rp.instances[g40_i].opaque_fbmask,
+				     (unsigned)rp.instances[g40_i].channel_shuffle,
+				     (unsigned)rp.instances[g40_i].z_sensitive,
+				     (unsigned)rp.instances[g40_i].z_write,
+				     (unsigned)rp.instances[g40_i].sampling_rate_x_log2,
+				     (unsigned)rp.instances[g40_i].sampling_rate_y_log2,
+				     (unsigned)rp.instances[g40_i].base_x, (unsigned)rp.instances[g40_i].base_y,
+				     (unsigned)rp.instances[g40_i].coarse_tiles_width,
+				     (unsigned)rp.instances[g40_i].coarse_tiles_height);
+			}
+			LOGI("G40: O4m ford=%u cord=%d texdims=%ux%u created=%u longterm=%u tbp0=%u tbw=%u psm=%u lv=%u smp=%u reuse=%u hash=%016llx.\n",
+			     g40_ford, g40_cord, g40_tex_w, g40_tex_h,
+			     (unsigned)g40_tex_created, (unsigned)g40_tex_longterm,
+			     g40_tex_tbp0, g40_tex_tbw, g40_tex_psm, g40_tex_levels, g40_tex_samples,
+			     g40_tex_reuse, (unsigned long long)g40_tex_hash);
+			g40_tex_reuse = 0;
+			if (g40_cord == 0 || g40_cord == 1)
+			{
+				// G40 O2: literal pre-composite B from the O2x chain (B is
+				// untouched between flushes: scenes are single-inst FBP0
+				// (G11) and vpage excludes 112..223 except via composite).
+				if (g40_last_valid)
+				{
+					LOGI("G40: O2 ford=%u cord=%d B pre-fnv=%016llx nz=%u head=%02x%02x%02x%02x%02x%02x%02x%02x srcford=%u.\n",
+					     g40_ford, g40_cord, (unsigned long long)g40_last_f, (unsigned)g40_last_z,
+					     g40_last_head[0], g40_last_head[1], g40_last_head[2], g40_last_head[3],
+					     g40_last_head[4], g40_last_head[5], g40_last_head[6], g40_last_head[7],
+					     g40_last_ford);
+				}
+				else
+				{
+					LOGI("G40: O2 ford=%u cord=%d B pre=load (no prior flush; eea04488c453e75b/149721 receipted).\n",
+					     g40_ford, g40_cord);
+				}
+				// G40 probe: record GPU-side copies, force full submit + wait,
+				// then read host B (O3), gpu B (O3b) and texture bytes (O4).
+				bool g40_rec = renderer.g40_record_probes(g40_tex_hold.get(), g40_tex_w, g40_tex_h);
+				uint64_t g40_tl = tracker.mark_submission_timeline(FlushReason::HostAccess);
+				renderer.flush_submit(g40_tl);
+				renderer.wait_timeline(g40_tl);
+				{
+					const size_t g40_base = 112 * 8192;
+					const size_t g40_n = 112 * 8192;
+					const uint8_t *g40_vram = static_cast<const uint8_t *>(map_vram_read(g40_base, g40_n));
+					if (g40_vram)
+					{
+						uint64_t g40_f = 0;
+						uint32_t g40_z = 0;
+						g40_fnv(g40_vram, g40_n, g40_f, g40_z);
+						LOGI("G40: O3 ford=%u cord=%d rec=%u B post-fnv=%016llx nz=%u head=%02x%02x%02x%02x%02x%02x%02x%02x.\n",
+						     g40_ford, g40_cord, (unsigned)g40_rec,
+						     (unsigned long long)g40_f, (unsigned)g40_z,
+						     g40_vram[0], g40_vram[1], g40_vram[2], g40_vram[3],
+						     g40_vram[4], g40_vram[5], g40_vram[6], g40_vram[7]);
+					}
+					else
+					{
+						LOGI("G40: O3 ford=%u cord=%d rec=%u map failed.\n",
+						     g40_ford, g40_cord, (unsigned)g40_rec);
+					}
+				}
+				{
+					uint64_t g40_tfnv = 0;
+					uint64_t g40_gfnv = 0;
+					uint32_t g40_tnz = 0;
+					uint32_t g40_gnz = 0;
+					uint8_t g40_thead[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+					uint8_t g40_ghead[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+					bool g40_fin = renderer.g40_finish_probes(g40_tfnv, g40_tnz, g40_thead,
+					                                          g40_gfnv, g40_gnz, g40_ghead);
+					LOGI("G40: O3b ford=%u cord=%d fin=%u gpuB-fnv=%016llx nz=%u head=%02x%02x%02x%02x%02x%02x%02x%02x.\n",
+					     g40_ford, g40_cord, (unsigned)g40_fin,
+					     (unsigned long long)g40_gfnv, (unsigned)g40_gnz,
+					     g40_ghead[0], g40_ghead[1], g40_ghead[2], g40_ghead[3],
+					     g40_ghead[4], g40_ghead[5], g40_ghead[6], g40_ghead[7]);
+					LOGI("G40: O4 ford=%u cord=%d fin=%u tex-fnv=%016llx nz=%u head=%02x%02x%02x%02x%02x%02x%02x%02x dims=%ux%u.\n",
+					     g40_ford, g40_cord, (unsigned)g40_fin,
+					     (unsigned long long)g40_tfnv, (unsigned)g40_tnz,
+					     g40_thead[0], g40_thead[1], g40_thead[2], g40_thead[3],
+					     g40_thead[4], g40_thead[5], g40_thead[6], g40_thead[7],
+					     g40_tex_w, g40_tex_h);
+				}
+			}
+			g40_busy = false;
+		}
+		else if (g40_entry_prims > 0)
+		{
+			// G40 O2x: inter-flush B at scene-flush end (safe: prims reset;
+			// busy-guarded against recursion). Pure read expected (A-only
+			// work leaves no B writes pending); the bytes self-report.
+			g40_busy = true;
+			{
+				const size_t g40_base = 112 * 8192;
+				const size_t g40_n = 112 * 8192;
+				const uint8_t *g40_vram = static_cast<const uint8_t *>(map_vram_read(g40_base, g40_n));
+				if (g40_vram)
+				{
+					uint64_t g40_f = 0;
+					uint32_t g40_z = 0;
+					g40_fnv(g40_vram, g40_n, g40_f, g40_z);
+					g40_last_valid = true;
+					g40_last_ford = g40_ford;
+					g40_last_f = g40_f;
+					g40_last_z = g40_z;
+					for (unsigned g40_b = 0; g40_b < 8; g40_b++)
+						g40_last_head[g40_b] = g40_vram[g40_b];
+					LOGI("G40: O2x ford=%u B postflush-fnv=%016llx nz=%u head=%02x%02x%02x%02x%02x%02x%02x%02x.\n",
+					     g40_ford, (unsigned long long)g40_f, (unsigned)g40_z,
+					     g40_vram[0], g40_vram[1], g40_vram[2], g40_vram[3],
+					     g40_vram[4], g40_vram[5], g40_vram[6], g40_vram[7]);
+				}
+				else
+				{
+					LOGI("G40: O2x ford=%u map failed.\n", g40_ford);
+				}
+			}
+			g40_busy = false;
+		}
+	}
+	if (g41_outer) // G41 end: cord join + (at cord 1) hash breakdown + canary
+	{
+		if (g41_is_comp)
+		{
+			int g41_fire = g40_outer ? g40_cord : g41_cord;
+			auto g41_dump_state = [this](const char *g41_tag, int g41_cord_tag) {
+				LOGI("G41: st %s cord=%d ofx=%d ofy=%d scilo=%d,%d scihi=%d,%d scixfb=%d wrap=%u dirty=%08x ss=%u,%u prim=%016llx frame0=%016llx scis0=%016llx xyof0=%016llx test0=%016llx zbuf0=%016llx tex0_0=%016llx alpha0=%016llx ac=%u.\n",
+				     g41_tag, g41_cord_tag,
+				     render_pass.ofx, render_pass.ofy,
+				     render_pass.scissor_lo.x, render_pass.scissor_lo.y,
+				     render_pass.scissor_hi.x, render_pass.scissor_hi.y,
+				     render_pass.scissor_hi_x_fb, (unsigned)render_pass.can_fb_wraparound,
+				     (unsigned)state_tracker.dirty_flags,
+				     sampling_rate_x_log2, sampling_rate_y_log2,
+				     (unsigned long long)registers.prim.bits,
+				     (unsigned long long)registers.ctx[0].frame.bits,
+				     (unsigned long long)registers.ctx[0].scissor.bits,
+				     (unsigned long long)registers.ctx[0].xyoffset.bits,
+				     (unsigned long long)registers.ctx[0].test.bits,
+				     (unsigned long long)registers.ctx[0].zbuf.bits,
+				     (unsigned long long)registers.ctx[0].tex0.bits,
+				     (unsigned long long)registers.ctx[0].alpha.bits,
+				     (unsigned)registers.prmodecont.desc.AC);
+			};
+			LOGI("G41: cord g41=%d g40=%d ford=%u prims=%u tex=%u.\n",
+			     g41_cord, g40_cord, g41_ford, g41_entry_prims, g41_tex_count);
+			g41_dump_state("cord", g41_fire);
+			if (g41_fire == 1)
+			{
+				{
+					// G41 (b): O4m hash-input breakdown at cord 1. The last
+					// texture resolve before this flush is the composite's
+					// (single-texture pass, tex=1); recompute the hash from
+					// the same 8 inputs to prove the breakdown is complete.
+					const TextureDescriptor &g41_d = state_tracker.last_texture_descriptor;
+					Util::Hasher g41_h;
+					g41_h.u64(g41_d.tex0.bits);
+					g41_h.u64(g41_d.tex1.bits);
+					g41_h.u64(g41_d.texa.bits);
+					g41_h.u64(g41_d.miptbp1_3.bits);
+					g41_h.u64(g41_d.miptbp4_6.bits);
+					g41_h.u64(g41_d.clamp.bits);
+					g41_h.u64(g41_d.palette_bank);
+					g41_h.u32(g41_d.samples);
+					unsigned g41_lctx = registers.prim.desc.CTXT & 1;
+					LOGI("G41: hash inputs tex0=%016llx tex1=%016llx texa=%016llx mb13=%016llx mb46=%016llx clamp=%016llx bank=%u smp=%u recomp=%016llx TBP0=%u TBW=%u TPSM=%u.\n",
+					     (unsigned long long)g41_d.tex0.bits,
+					     (unsigned long long)g41_d.tex1.bits,
+					     (unsigned long long)g41_d.texa.bits,
+					     (unsigned long long)g41_d.miptbp1_3.bits,
+					     (unsigned long long)g41_d.miptbp4_6.bits,
+					     (unsigned long long)g41_d.clamp.bits,
+					     g41_d.palette_bank, g41_d.samples,
+					     (unsigned long long)g41_h.get(),
+					     (unsigned)g41_d.tex0.desc.TBP0, (unsigned)g41_d.tex0.desc.TBW,
+					     (unsigned)g41_d.tex0.desc.PSM);
+					LOGI("G41: hash rect x=%u y=%u w=%u h=%u lv=%u ctx=%u rtex0=%016llx rtex1=%016llx rclamp=%016llx rmb13=%016llx rmb46=%016llx rtexa=%016llx.\n",
+					     g41_d.rect.x, g41_d.rect.y, g41_d.rect.width, g41_d.rect.height,
+					     g41_d.rect.levels, g41_lctx,
+					     (unsigned long long)registers.ctx[g41_lctx].tex0.bits,
+					     (unsigned long long)registers.ctx[g41_lctx].tex1.bits,
+					     (unsigned long long)registers.ctx[g41_lctx].clamp.bits,
+					     (unsigned long long)registers.ctx[g41_lctx].miptbl_1_3.bits,
+					     (unsigned long long)registers.ctx[g41_lctx].miptbl_4_6.bits,
+					     (unsigned long long)registers.texa.bits);
+					if (g41_has_texinfo)
+					{
+						LOGI("G41: hash texinfo n=%u sizes=%.1f,%.1f,%.6f,%.6f region=%.1f,%.1f,%.1f,%.1f bias=%.6f,%.6f arrayed=%d flags=%d.\n",
+						     g41_tex_count,
+						     g41_texinfo.sizes.x, g41_texinfo.sizes.y,
+						     g41_texinfo.sizes.z, g41_texinfo.sizes.w,
+						     g41_texinfo.region.x, g41_texinfo.region.y,
+						     g41_texinfo.region.z, g41_texinfo.region.w,
+						     g41_texinfo.bias.x, g41_texinfo.bias.y,
+						     g41_texinfo.arrayed, g41_texinfo.flags);
+					}
+					else
+					{
+						LOGI("G41: hash texinfo EMPTY n=%u.\n", g41_tex_count);
+					}
+				}
+				{
+					// G41 canary: 5 synthetic sprites (C1..C5) into scratch
+					// arena pages 492..511 (never B) through the live draw
+					// path. Per-cell register + VRAM save/restore; G40 rows
+					// suppressed (g40_busy held) so game O-rows stay 0-diff.
+					g40_busy = true;
+					unsigned g41_s_kseen = g40_k_seen;
+					unsigned g41_s_kadc = g40_k_adc;
+					unsigned g41_s_kdeg = g40_k_deg;
+					unsigned g41_s_kbb = g40_k_bb;
+					unsigned g41_s_kfuse = g40_k_fuse;
+					unsigned g41_s_kacc = g40_k_acc;
+					unsigned g41_s_treuse = g40_tex_reuse;
+					bool g41_s_tmade = g40_tex_created;
+					uint64_t g41_s_thash = g40_tex_hash;
+					unsigned g41_s_ttbp0 = g40_tex_tbp0;
+					unsigned g41_s_ttbw = g40_tex_tbw;
+					unsigned g41_s_tpsm = g40_tex_psm;
+					unsigned g41_s_tlv = g40_tex_levels;
+					unsigned g41_s_tsmp = g40_tex_samples;
+					bool g41_s_tlt = g40_tex_longterm;
+					VertexPosition g41_vq_pos[3];
+					VertexAttribute g41_vq_attr[3];
+					for (unsigned g41_vqi = 0; g41_vqi < 3; g41_vqi++)
+					{
+						g41_vq_pos[g41_vqi] = vertex_queue.pos[g41_vqi];
+						g41_vq_attr[g41_vqi] = vertex_queue.attr[g41_vqi];
+					}
+					unsigned g41_vq_n = vertex_queue.count;
+					StateTracker g41_saved_st = state_tracker;
+					auto g41_saved_pf = render_pass.potential_feedback;
+					auto g41_saved_porder = render_pass.last_triangle_parallelogram_order;
+					ivec2 g41_saved_scilo = render_pass.scissor_lo;
+					ivec2 g41_saved_scihi = render_pass.scissor_hi;
+					int g41_saved_scixfb = render_pass.scissor_hi_x_fb;
+					bool g41_saved_wrap = render_pass.can_fb_wraparound;
+					g41_dump_state("cstart", 1);
+					const size_t g41_abase = size_t(G41_ARENA_BASE_PAGE) * 8192;
+					const size_t g41_an = size_t(G41_ARENA_NPAGES) * 8192;
+					bool g41_pre_ok = false;
+					std::vector<uint8_t> g41_pre(g41_an, 0);
+					{
+						const uint8_t *g41_a = static_cast<const uint8_t *>(map_vram_read(g41_abase, g41_an));
+						if (!g41_a)
+						{
+							LOGI("G41: canary ABORT arena pre-read map failed.\n");
+						}
+						else
+						{
+							memcpy(g41_pre.data(), g41_a, g41_an);
+							g41_pre_ok = true;
+							uint64_t g41_pf = 0;
+							uint32_t g41_pz = 0;
+							g41_fnv(g41_pre.data(), g41_an, g41_pf, g41_pz);
+							LOGI("G41: arena pre-fnv=%016llx nz=%u head=%02x%02x%02x%02x%02x%02x%02x%02x vq=%u.\n",
+							     (unsigned long long)g41_pf, (unsigned)g41_pz,
+							     g41_pre[0], g41_pre[1], g41_pre[2], g41_pre[3],
+							     g41_pre[4], g41_pre[5], g41_pre[6], g41_pre[7],
+							     g41_vq_n);
+						}
+					}
+					static const unsigned g41_fbp[5] = { 492, 496, 500, 504, 508 };
+					static const unsigned g41_psm[5] = { 0, 0, 1, 1, 1 };
+					static const uint32_t g41_msk[5] = { 0, 0xff000000u, 0, 0xff000000u, 0xff000000u };
+					for (unsigned g41_cell = 0; g41_cell < 5 && g41_pre_ok; g41_cell++)
+					{
+						bool g41_c5 = g41_cell == 4;
+						unsigned g41_lctx = registers.prim.desc.CTXT & 1;
+						RegisterAddr g41_a_frame = g41_lctx ? RegisterAddr::FRAME_2 : RegisterAddr::FRAME_1;
+						RegisterAddr g41_a_zbuf = g41_lctx ? RegisterAddr::ZBUF_2 : RegisterAddr::ZBUF_1;
+						RegisterAddr g41_a_test = g41_lctx ? RegisterAddr::TEST_2 : RegisterAddr::TEST_1;
+						RegisterAddr g41_a_scis = g41_lctx ? RegisterAddr::SCISSOR_2 : RegisterAddr::SCISSOR_1;
+						RegisterAddr g41_a_xyof = g41_lctx ? RegisterAddr::XYOFFSET_2 : RegisterAddr::XYOFFSET_1;
+						RegisterAddr g41_a_fba = g41_lctx ? RegisterAddr::FBA_2 : RegisterAddr::FBA_1;
+						uint64_t g41_s_prim = registers.prim.bits;
+						uint64_t g41_s_rgbaq = registers.rgbaq.bits;
+						uint64_t g41_s_st = registers.st.bits;
+						uint64_t g41_s_uv = registers.uv.bits;
+						uint64_t g41_s_frame = registers.ctx[g41_lctx].frame.bits;
+						uint64_t g41_s_zbuf = registers.ctx[g41_lctx].zbuf.bits;
+						uint64_t g41_s_test = registers.ctx[g41_lctx].test.bits;
+						uint64_t g41_s_scis = registers.ctx[g41_lctx].scissor.bits;
+						uint64_t g41_s_xyof = registers.ctx[g41_lctx].xyoffset.bits;
+						uint64_t g41_s_fba = registers.ctx[g41_lctx].fba.bits;
+						uint64_t g41_s_pabe = registers.pabe.bits;
+						RegisterState g41_live_all = registers;
+						bool g41_void = false;
+						if (!g41_c5)
+						{
+							Reg64<PRIMBits> g41_p;
+							g41_p.bits = 0;
+							g41_p.desc.PRIM = 6;
+							g41_p.desc.CTXT = g41_lctx;
+							write_register(RegisterAddr::PRIM, g41_p.bits);
+							write_register(RegisterAddr::PRMODE, g41_p.bits);
+							Reg64<RGBAQBits> g41_c;
+							g41_c.bits = 0;
+							g41_c.desc.R = 0x11;
+							g41_c.desc.G = 0x22;
+							g41_c.desc.B = 0x33;
+							g41_c.desc.A = 0x44;
+							g41_c.desc.Q = 1.0f;
+							write_register(RegisterAddr::RGBAQ, g41_c.bits);
+							write_register(g41_a_xyof, uint64_t(0));
+							Reg64<SCISSORBits> g41_sc;
+							g41_sc.bits = 0;
+							g41_sc.desc.SCAX0 = 0;
+							g41_sc.desc.SCAY0 = 0;
+							g41_sc.desc.SCAX1 = 63;
+							g41_sc.desc.SCAY1 = 63;
+							write_register(g41_a_scis, g41_sc.bits);
+							write_register(g41_a_test, uint64_t(0));
+							write_register(g41_a_fba, uint64_t(0));
+							write_register(RegisterAddr::PABE, uint64_t(0));
+							Reg64<FRAMEBits> g41_f;
+							g41_f.bits = 0;
+							g41_f.desc.FBP = g41_fbp[g41_cell];
+							g41_f.desc.FBW = 8;
+							g41_f.desc.PSM = g41_psm[g41_cell];
+							g41_f.desc.FBMSK = g41_msk[g41_cell];
+							write_register(g41_a_frame, g41_f.bits);
+							Reg64<ZBUFBits> g41_z;
+							g41_z.bits = 0;
+							g41_z.desc.ZBP = 511;
+							g41_z.desc.ZMSK = 1;
+							write_register(g41_a_zbuf, g41_z.bits);
+						}
+						else
+						{
+							// G41-R1: C5 replays the composite's kick-time
+							// registers (last FBP112 append), redirected to
+							// scratch (FBP) + fixed geometry.
+							unsigned g41_sctx = g41_snap_regs.prim.desc.CTXT & 1;
+							if (!g41_snap_valid)
+							{
+								LOGI("G41: C5 NO-SNAPSHOT (void).\n");
+								g41_void = true;
+							}
+							else if (g41_sctx != g41_lctx)
+							{
+								LOGI("G41: C5 ctxt-mismatch snap=%u live=%u (void).\n", g41_sctx, g41_lctx);
+								g41_void = true;
+							}
+							else
+							{
+								const RegisterState &g41_src = g41_snap_regs;
+								write_register(RegisterAddr::PRIM, g41_src.prim.bits);
+								write_register(RegisterAddr::PRMODE, g41_src.prim.bits);
+								Reg64<RGBAQBits> g41_rq;
+								g41_rq.bits = g41_src.rgbaq.bits;
+								g41_rq.desc.Q = 1.0f;
+								write_register(RegisterAddr::RGBAQ, g41_rq.bits);
+								write_register(RegisterAddr::ST, g41_src.st.bits);
+								write_register(RegisterAddr::UV, g41_src.uv.bits);
+								write_register(RegisterAddr::FOG, g41_src.fog.bits);
+								write_register(RegisterAddr::PRMODECONT, g41_src.prmodecont.bits);
+								write_register(RegisterAddr::TEXCLUT, g41_src.texclut.bits);
+								write_register(RegisterAddr::TEXA, g41_src.texa.bits);
+								write_register(RegisterAddr::FOGCOL, g41_src.fogcol.bits);
+								write_register(RegisterAddr::DIMX, g41_src.dimx.bits);
+								write_register(RegisterAddr::DTHE, g41_src.dthe.bits);
+								write_register(RegisterAddr::COLCLAMP, g41_src.colclamp.bits);
+								write_register(RegisterAddr::PABE, g41_src.pabe.bits);
+								write_register(RegisterAddr::SCANMSK, g41_src.scanmsk.bits);
+								write_register(g41_sctx ? RegisterAddr::TEX0_2 : RegisterAddr::TEX0_1, g41_src.ctx[g41_sctx].tex0.bits);
+								write_register(g41_sctx ? RegisterAddr::TEX1_2 : RegisterAddr::TEX1_1, g41_src.ctx[g41_sctx].tex1.bits);
+								write_register(g41_sctx ? RegisterAddr::CLAMP_2 : RegisterAddr::CLAMP_1, g41_src.ctx[g41_sctx].clamp.bits);
+								write_register(g41_sctx ? RegisterAddr::MIPTBP1_2 : RegisterAddr::MIPTBP1_1, g41_src.ctx[g41_sctx].miptbl_1_3.bits);
+								write_register(g41_sctx ? RegisterAddr::MIPTBP2_2 : RegisterAddr::MIPTBP2_1, g41_src.ctx[g41_sctx].miptbl_4_6.bits);
+								write_register(g41_sctx ? RegisterAddr::ALPHA_2 : RegisterAddr::ALPHA_1, g41_src.ctx[g41_sctx].alpha.bits);
+								write_register(g41_a_test, g41_src.ctx[g41_sctx].test.bits);
+								write_register(g41_a_fba, g41_src.ctx[g41_sctx].fba.bits);
+								Reg64<FRAMEBits> g41_f;
+								g41_f.bits = g41_src.ctx[g41_sctx].frame.bits;
+								g41_f.desc.FBP = g41_fbp[g41_cell];
+								write_register(g41_a_frame, g41_f.bits);
+								write_register(g41_a_zbuf, g41_src.ctx[g41_sctx].zbuf.bits);
+								write_register(g41_a_xyof, uint64_t(0));
+								Reg64<SCISSORBits> g41_sc;
+								g41_sc.bits = 0;
+								g41_sc.desc.SCAX0 = 0;
+								g41_sc.desc.SCAY0 = 0;
+								g41_sc.desc.SCAX1 = 63;
+								g41_sc.desc.SCAY1 = 63;
+								write_register(g41_a_scis, g41_sc.bits);
+								LOGI("G41: C5 snap prim=%016llx frame=%016llx test=%016llx zbuf=%016llx tex0=%016llx alpha=%016llx fba=%016llx pabe=%016llx.\n",
+								     (unsigned long long)g41_src.prim.bits,
+								     (unsigned long long)g41_src.ctx[g41_sctx].frame.bits,
+								     (unsigned long long)g41_src.ctx[g41_sctx].test.bits,
+								     (unsigned long long)g41_src.ctx[g41_sctx].zbuf.bits,
+								     (unsigned long long)g41_src.ctx[g41_sctx].tex0.bits,
+								     (unsigned long long)g41_src.ctx[g41_sctx].alpha.bits,
+								     (unsigned long long)g41_src.ctx[g41_sctx].fba.bits,
+								     (unsigned long long)g41_src.pabe.bits);
+							}
+						}
+						if (g41_void) continue;
+						reset_vertex_queue();
+						Reg64<XYZBits> g41_v0;
+						g41_v0.bits = 0;
+						g41_v0.desc.X = 0;
+						g41_v0.desc.Y = 0;
+						g41_v0.desc.Z = 0;
+						Reg64<XYZBits> g41_v1;
+						g41_v1.bits = 0;
+						g41_v1.desc.X = 31 << 4;
+						g41_v1.desc.Y = 31 << 4;
+						g41_v1.desc.Z = 0;
+						if (g41_c5)
+						{
+							Reg64<UVBits> g41_u0;
+							g41_u0.bits = 0;
+							g41_u0.desc.U = 0;
+							g41_u0.desc.V = 0;
+							Reg64<STBits> g41_s0;
+							g41_s0.bits = 0;
+							write_register(RegisterAddr::UV, g41_u0.bits);
+							write_register(RegisterAddr::ST, g41_s0.bits);
+						}
+						write_register(RegisterAddr::XYZ2, g41_v0.bits);
+						if (g41_c5)
+						{
+							Reg64<UVBits> g41_u1;
+							g41_u1.bits = 0;
+							g41_u1.desc.U = 511;
+							g41_u1.desc.V = 511;
+							Reg64<STBits> g41_s1;
+							g41_s1.bits = 0;
+							g41_s1.desc.S = 511.0f;
+							g41_s1.desc.T = 511.0f;
+							write_register(RegisterAddr::UV, g41_u1.bits);
+							write_register(RegisterAddr::ST, g41_s1.bits);
+						}
+						write_register(RegisterAddr::XYZ2, g41_v1.bits);
+						unsigned g41_acc = render_pass.primitive_count;
+						{
+							const auto &g41_kinst = render_pass.instances[render_pass.current_instance];
+							LOGI("G41: C%u kick acc=%u ctx=%u prim=%016llx FBP=%u FBW=%u PSM=%u MSK=%08x ZBP=%u ZMSK=%u bb=%d,%d,%d,%d.\n",
+							     g41_cell + 1, g41_acc, g41_lctx,
+							     (unsigned long long)registers.prim.bits,
+							     (unsigned)g41_kinst.frame.desc.FBP,
+							     (unsigned)g41_kinst.frame.desc.FBW,
+							     (unsigned)g41_kinst.frame.desc.PSM,
+							     (unsigned)g41_kinst.frame.desc.FBMSK,
+							     (unsigned)g41_kinst.zbuf.desc.ZBP,
+							     (unsigned)g41_kinst.zbuf.desc.ZMSK,
+							     g41_kinst.bb.x, g41_kinst.bb.y, g41_kinst.bb.z, g41_kinst.bb.w);
+						}
+						flush_render_pass(FlushReason::SubmissionFlush);
+						uint64_t g41_tl = tracker.mark_submission_timeline(FlushReason::HostAccess);
+						renderer.flush_submit(g41_tl);
+						renderer.wait_timeline(g41_tl);
+						{
+							const uint8_t *g41_a = static_cast<const uint8_t *>(map_vram_read(g41_abase, g41_an));
+							if (!g41_a)
+							{
+								LOGI("G41: C%u verd acc=%u map failed.\n", g41_cell + 1, g41_acc);
+							}
+							else
+							{
+								unsigned g41_nchg = 0;
+								unsigned g41_chg0 = 0;
+								for (unsigned g41_pg = 0; g41_pg < G41_ARENA_NPAGES; g41_pg++)
+								{
+									if (memcmp(g41_a + g41_pg * 8192, &g41_pre[g41_pg * 8192], 8192) != 0)
+									{
+										if (g41_nchg == 0)
+											g41_chg0 = G41_ARENA_BASE_PAGE + g41_pg;
+										g41_nchg++;
+									}
+								}
+								LOGI("G41: C%u verd acc=%u landed=%u nchg=%u chg0=%u fbp=%u.\n",
+								     g41_cell + 1, g41_acc, g41_nchg ? 1 : 0, g41_nchg, g41_chg0,
+								     g41_fbp[g41_cell]);
+								unsigned g41_shown = 0;
+								for (unsigned g41_pg = 0; g41_pg < G41_ARENA_NPAGES && g41_shown < 8; g41_pg++)
+									{
+									if (memcmp(g41_a + g41_pg * 8192, &g41_pre[g41_pg * 8192], 8192) != 0)
+									{
+										uint64_t g41_cf = 0;
+										uint32_t g41_cz = 0;
+										g41_fnv(g41_a + g41_pg * 8192, 8192, g41_cf, g41_cz);
+										const uint8_t *g41_cp = g41_a + g41_pg * 8192;
+										LOGI("G41: C%u chg page=%u fnv=%016llx nz=%u head=%02x%02x%02x%02x%02x%02x%02x%02x.\n",
+										     g41_cell + 1, G41_ARENA_BASE_PAGE + g41_pg,
+										     (unsigned long long)g41_cf, (unsigned)g41_cz,
+										     g41_cp[0], g41_cp[1], g41_cp[2], g41_cp[3],
+										     g41_cp[4], g41_cp[5], g41_cp[6], g41_cp[7]);
+										g41_shown++;
+									}
+								}
+							}
+						}
+						{
+							uint8_t *g41_w = static_cast<uint8_t *>(map_vram_write(g41_abase, g41_an));
+							if (!g41_w)
+							{
+								LOGI("G41: C%u restored=MAPFAIL.\n", g41_cell + 1);
+							}
+							else
+							{
+								memcpy(g41_w, g41_pre.data(), g41_an);
+								end_vram_write(g41_abase, g41_an);
+								uint64_t g41_tl2 = tracker.mark_submission_timeline(FlushReason::HostAccess);
+								renderer.flush_submit(g41_tl2);
+								renderer.wait_timeline(g41_tl2);
+								const uint8_t *g41_v = static_cast<const uint8_t *>(map_vram_read(g41_abase, g41_an));
+								unsigned g41_rok = (g41_v && memcmp(g41_v, g41_pre.data(), g41_an) == 0) ? 1 : 0;
+								LOGI("G41: C%u restored=%u.\n", g41_cell + 1, g41_rok);
+							}
+						}
+						if (g41_c5 && !g41_void)
+						{
+							write_register(RegisterAddr::FOG, g41_live_all.fog.bits);
+							write_register(RegisterAddr::PRMODECONT, g41_live_all.prmodecont.bits);
+							write_register(RegisterAddr::TEXCLUT, g41_live_all.texclut.bits);
+							write_register(RegisterAddr::TEXA, g41_live_all.texa.bits);
+							write_register(RegisterAddr::FOGCOL, g41_live_all.fogcol.bits);
+							write_register(RegisterAddr::DIMX, g41_live_all.dimx.bits);
+							write_register(RegisterAddr::DTHE, g41_live_all.dthe.bits);
+							write_register(RegisterAddr::COLCLAMP, g41_live_all.colclamp.bits);
+							write_register(RegisterAddr::SCANMSK, g41_live_all.scanmsk.bits);
+							write_register(g41_lctx ? RegisterAddr::TEX0_2 : RegisterAddr::TEX0_1, g41_live_all.ctx[g41_lctx].tex0.bits);
+							write_register(g41_lctx ? RegisterAddr::TEX1_2 : RegisterAddr::TEX1_1, g41_live_all.ctx[g41_lctx].tex1.bits);
+							write_register(g41_lctx ? RegisterAddr::CLAMP_2 : RegisterAddr::CLAMP_1, g41_live_all.ctx[g41_lctx].clamp.bits);
+							write_register(g41_lctx ? RegisterAddr::MIPTBP1_2 : RegisterAddr::MIPTBP1_1, g41_live_all.ctx[g41_lctx].miptbl_1_3.bits);
+							write_register(g41_lctx ? RegisterAddr::MIPTBP2_2 : RegisterAddr::MIPTBP2_1, g41_live_all.ctx[g41_lctx].miptbl_4_6.bits);
+							write_register(g41_lctx ? RegisterAddr::ALPHA_2 : RegisterAddr::ALPHA_1, g41_live_all.ctx[g41_lctx].alpha.bits);
+						}
+						write_register(g41_a_frame, g41_s_frame);
+						write_register(g41_a_zbuf, g41_s_zbuf);
+						write_register(g41_a_test, g41_s_test);
+						write_register(g41_a_scis, g41_s_scis);
+						write_register(g41_a_xyof, g41_s_xyof);
+						write_register(g41_a_fba, g41_s_fba);
+						write_register(RegisterAddr::PABE, g41_s_pabe);
+						write_register(RegisterAddr::RGBAQ, g41_s_rgbaq);
+						write_register(RegisterAddr::ST, g41_s_st);
+						write_register(RegisterAddr::UV, g41_s_uv);
+						write_register(RegisterAddr::PRIM, g41_s_prim);
+						write_register(RegisterAddr::PRMODE, g41_s_prim);
+						reset_vertex_queue();
+					}
+					state_tracker = g41_saved_st;
+					render_pass.potential_feedback = g41_saved_pf;
+					render_pass.last_triangle_parallelogram_order = g41_saved_porder;
+					render_pass.scissor_lo = g41_saved_scilo;
+					render_pass.scissor_hi = g41_saved_scihi;
+					render_pass.scissor_hi_x_fb = g41_saved_scixfb;
+					render_pass.can_fb_wraparound = g41_saved_wrap;
+					g41_dump_state("cend", 1);
+					for (unsigned g41_vqi = 0; g41_vqi < 3; g41_vqi++)
+					{
+						vertex_queue.pos[g41_vqi] = g41_vq_pos[g41_vqi];
+						vertex_queue.attr[g41_vqi] = g41_vq_attr[g41_vqi];
+					}
+					vertex_queue.count = g41_vq_n;
+					g40_k_seen = g41_s_kseen;
+					g40_k_adc = g41_s_kadc;
+					g40_k_deg = g41_s_kdeg;
+					g40_k_bb = g41_s_kbb;
+					g40_k_fuse = g41_s_kfuse;
+					g40_k_acc = g41_s_kacc;
+					g40_tex_reuse = g41_s_treuse;
+					g40_tex_created = g41_s_tmade;
+					g40_tex_hash = g41_s_thash;
+					g40_tex_tbp0 = g41_s_ttbp0;
+					g40_tex_tbw = g41_s_ttbw;
+					g40_tex_psm = g41_s_tpsm;
+					g40_tex_levels = g41_s_tlv;
+					g40_tex_samples = g41_s_tsmp;
+					g40_tex_longterm = g41_s_tlt;
+					g40_busy = false;
+				}
+			}
+			g41_busy = false;
+		}
+	}
 }
 
 void GSInterface::flush(PageTrackerFlushFlags flags, FlushReason reason)
@@ -1257,6 +2084,8 @@ uint32_t GSInterface::drawing_kick_update_texture(FBFeedbackMode feedback_mode, 
 	{
 		assert(state_tracker.last_texture_index != UINT32_MAX);
 		assert(state_tracker.last_texture_index_valid_at_texflush == state_tracker.texflush_counter);
+		if (g40_enabled()) // G40 O4m
+			g40_tex_reuse++;
 		return state_tracker.last_texture_index;
 	}
 
@@ -1661,14 +2490,19 @@ uint32_t GSInterface::drawing_kick_update_texture(FBFeedbackMode feedback_mode, 
 		state_tracker.last_texture_index_valid_at_texflush = state_tracker.texflush_counter;
 		if (cached_index && cached_index->valid)
 			cached_index->valid_at_texflush = state_tracker.texflush_counter;
+		if (g40_enabled()) // G40 O4m
+			g40_tex_reuse++;
 		return state_tracker.last_texture_index;
 	}
 
 	uint32_t texture_index;
+	bool g40_tex_made = false; // G40 O4
 
 	if (cached_index && cached_index->valid)
 	{
 		texture_index = cached_index->index;
+		if (g40_enabled()) // G40 O4m
+			g40_tex_reuse++;
 	}
 	else
 	{
@@ -1707,6 +2541,7 @@ uint32_t GSInterface::drawing_kick_update_texture(FBFeedbackMode feedback_mode, 
 			TRACE("CACHE IMAGE", desc);
 			desc.hash = hasher.get();
 			image = renderer.create_cached_texture(desc);
+			g40_tex_made = true; // G40 O4
 
 			// Long-term references can persist across render passes, and intended for normal resource textures.
 			// They will generally be invalidated when it's overwritten by a copy or FB write.
@@ -1804,6 +2639,17 @@ uint32_t GSInterface::drawing_kick_update_texture(FBFeedbackMode feedback_mode, 
 		render_pass.held_images.push_back(std::move(image));
 	}
 
+	if (g40_enabled()) // G40 O4: full-resolve snapshot (first use of a texture per pass)
+	{
+		g40_tex_created = g40_tex_made;
+		g40_tex_hash = hasher.get();
+		g40_tex_tbp0 = desc.tex0.desc.TBP0;
+		g40_tex_tbw = desc.tex0.desc.TBW;
+		g40_tex_psm = desc.tex0.desc.PSM;
+		g40_tex_levels = desc.rect.levels;
+		g40_tex_samples = desc.samples;
+		g40_tex_longterm = long_term_cache_texture;
+	}
 	state_tracker.last_texture_descriptor = desc;
 	state_tracker.last_texture_index = texture_index;
 	state_tracker.last_texture_index_valid_at_texflush = state_tracker.texflush_counter;
@@ -2484,6 +3330,11 @@ void GSInterface::drawing_kick_append()
 {
 	auto &prim = registers.prim;
 	auto &ctx = registers.ctx[prim.desc.CTXT];
+	if (g41_enabled() && ctx.frame.desc.FBP == 112)
+	{
+		g41_snap_regs = registers;
+		g41_snap_valid = true;
+	}
 
 	VertexAttribute attr[3];
 	VertexPosition pos[3];
@@ -2573,6 +3424,8 @@ void GSInterface::drawing_kick_append()
 	// Check for degenerate BB. Can happen if primitive is clipped away completely by scissor.
 	if (bb.z < bb.x || bb.w < bb.y)
 	{
+		if (g40_enabled()) // G40 O1
+			g40_k_bb++;
 		TRACE("Degenerate BB", bb);
 		return;
 	}
@@ -2604,6 +3457,8 @@ void GSInterface::drawing_kick_append()
 			         (render_pass.last_triangle_parallelogram_order.x << STATE_PARALLELOGRAM_PROVOKING_OFFSET);
 
 			render_pass.last_triangle_is_parallelogram_candidate = false;
+			if (g40_enabled()) // G40 O1
+				g40_k_fuse++;
 			TRACE("Promote Parallelogram", DummyBits{});
 			return;
 		}
@@ -2786,6 +3641,8 @@ void GSInterface::drawing_kick_append()
 
 		if (bb.z < bb.x)
 		{
+			if (g40_enabled()) // G40 O1
+				g40_k_bb++;
 			TRACE("Degenerate BB", bb);
 			return;
 		}
@@ -2835,6 +3692,8 @@ void GSInterface::drawing_kick_append()
 	memcpy(render_pass.positions + 3 * render_pass.primitive_count, pos, sizeof(pos));
 	memcpy(render_pass.attributes + 3 * render_pass.primitive_count, attr, sizeof(attr));
 	render_pass.primitive_count++;
+	if (g40_enabled()) // G40 O1
+		g40_k_acc++;
 	// Commit this here as well. Need to do it after flushing state, since that may reset any tracking state.
 	render_pass.last_triangle_is_parallelogram_candidate = is_parallelogram_candidate;
 	if (render_pass.current_primitive_is_channel_shuffle)
@@ -2872,12 +3731,21 @@ void GSInterface::drawing_kick_primitive(bool adc)
 	if (vertex_queue.count < num_vertices)
 		return;
 
+	if (g40_enabled()) // G40 O1	
+	{
+		g40_k_seen++;
+		g40_k_adc += adc ? 1 : 0;
+	}
 	if (!adc)
 	{
 		if (!draw_is_degenerate())
 			drawing_kick_append<list_primitive, fan_primitive, quad, num_vertices>();
 		else
+		{
+			if (g40_enabled()) // G40 O1
+				g40_k_deg++;
 			TRACE("Degenerate Draw", DummyBits{});
+		}
 	}
 
 	// We seem to do queue maintenance regardless after a vertex kick.
@@ -3896,6 +4764,15 @@ void GSInterface::update_internal_register(uint64_t &reg, uint64_t value, StateD
 
 void GSInterface::a_d_FRAME_1(uint64_t payload)
 {
+	// G11 local experiment hook (not upstream): draw-target identity.
+	if (registers.ctx[0].frame.bits != payload)
+	{
+		Reg64<FRAMEBits> g11_f;
+		g11_f.bits = payload;
+		LOGI("G11: FRAME_1 FBP=%u FBW=%u PSM=%u FBMSK=%08x\n",
+		     (unsigned)g11_f.desc.FBP, (unsigned)g11_f.desc.FBW,
+		     (unsigned)g11_f.desc.PSM, (unsigned)g11_f.desc.FBMSK);
+	}
 	update_internal_register(registers.ctx[0].frame.bits, payload,
 	                         STATE_DIRTY_DEGENERATE_BIT | STATE_DIRTY_FEEDBACK_BIT |
 	                         STATE_DIRTY_TEX_BIT | STATE_DIRTY_FB_BIT |
@@ -3905,6 +4782,15 @@ void GSInterface::a_d_FRAME_1(uint64_t payload)
 
 void GSInterface::a_d_FRAME_2(uint64_t payload)
 {
+	// G11 local experiment hook (not upstream): draw-target identity.
+	if (registers.ctx[1].frame.bits != payload)
+	{
+		Reg64<FRAMEBits> g11_f;
+		g11_f.bits = payload;
+		LOGI("G11: FRAME_2 FBP=%u FBW=%u PSM=%u FBMSK=%08x\n",
+		     (unsigned)g11_f.desc.FBP, (unsigned)g11_f.desc.FBW,
+		     (unsigned)g11_f.desc.PSM, (unsigned)g11_f.desc.FBMSK);
+	}
 	update_internal_register(registers.ctx[1].frame.bits, payload,
 	                         STATE_DIRTY_DEGENERATE_BIT | STATE_DIRTY_FEEDBACK_BIT |
 	                         STATE_DIRTY_TEX_BIT | STATE_DIRTY_FB_BIT |
@@ -4266,6 +5152,11 @@ const void *GSInterface::map_vram_read(size_t offset, size_t size)
 
 void GSInterface::flush()
 {
+	// G11 local experiment hook (not upstream): read-only accumulator
+	// census at submit time. Log-only; no behavior change.
+	LOGI("G11: flush() acc prims=%u instances=%u states=%u tex=%u\n",
+	     render_pass.primitive_count, render_pass.num_instances,
+	     (unsigned)render_pass.state_vectors.size(), (unsigned)render_pass.tex_infos.size());
 	flush_pending_transfer(true);
 	uint64_t value = tracker.mark_submission_timeline();
 	renderer.flush_submit(value);
@@ -4685,6 +5576,71 @@ ScanoutResult GSInterface::vsync(const VSyncInfo &info_)
 	auto result = renderer.vsync(priv_registers, info,
 	                             sampling_rate_x_log2, sampling_rate_y_log2,
 								 promoted1, promoted2);
+	{
+		// G31 local diagnostic (not upstream): in-vsync() (b1)/(b2) split
+		// probe. Promotion is statically OFF for this run (Hacks defaults
+		// false + set_hacks() uncalled anywhere), so promoted1/2 are
+		// predicted null on all 16 vsyncs; this dump confirms on-device
+		// and captures the DISPFB1-region VRAM bytes at sample time.
+		// Region B (FBP112 pages 112..223) is predicted == load (no
+		// writer ever touches it, G30); region A (FBP0) is the
+		// live-write control. FNV-1a reuses the SAME truncated basis as
+		// G29/G30 (G29-E1). Read-only: one host map + wait AFTER the
+		// vsync's own submission (no reordering); promotion identity is
+		// logged but no GPU readback is attempted (a present promoted
+		// image routes to OTHER/stop regardless -- checksum deferred).
+		static unsigned g31_seq = 0;
+		unsigned g31_p1null = promoted1 == nullptr ? 1 : 0;
+		unsigned g31_p1w = g31_p1null ? 0 : promoted1->get_width();
+		unsigned g31_p1h = g31_p1null ? 0 : promoted1->get_height();
+		unsigned g31_p1l = g31_p1null ? 0 : (unsigned)promoted1->get_create_info().layers;
+		unsigned g31_p1f = g31_p1null ? 0 : (unsigned)promoted1->get_format();
+		unsigned g31_p2null = promoted2 == nullptr ? 1 : 0;
+		LOGI("G31: state seq=%u EN1=%u EN2=%u DISPFB1=%u/%u/%u/%u/%u DSP1=%u/%u/%u/%u/%u/%u SM=%u/%u/%u nprom=%u hack=%d p1null=%u p1=%ux%ux%ux%u p2null=%u phase=%u.\n",
+		     g31_seq,
+		     (unsigned)priv_registers.pmode.EN1, (unsigned)priv_registers.pmode.EN2,
+		     (unsigned)priv_registers.dispfb1.FBP, (unsigned)priv_registers.dispfb1.FBW,
+		     (unsigned)priv_registers.dispfb1.PSM, (unsigned)priv_registers.dispfb1.DBX,
+		     (unsigned)priv_registers.dispfb1.DBY,
+		     (unsigned)priv_registers.display1.DW, (unsigned)priv_registers.display1.DH,
+		     (unsigned)priv_registers.display1.MAGH, (unsigned)priv_registers.display1.MAGV,
+		     (unsigned)priv_registers.display1.DX, (unsigned)priv_registers.display1.DY,
+		     (unsigned)priv_registers.smode1.CMOD, (unsigned)priv_registers.smode2.INT,
+		     (unsigned)priv_registers.smode2.FFMD,
+		     num_promoted_backbuffers, int(hacks.backbuffer_promotion),
+		     g31_p1null, g31_p1w, g31_p1h, g31_p1l, g31_p1f, g31_p2null, info.phase);
+		const size_t g31_n = 224 * 8192;
+		const size_t g31_half = 917504;
+		const uint8_t *g31_vram = static_cast<const uint8_t *>(map_vram_read(0, g31_n));
+		if (g31_vram)
+		{
+			uint64_t g31_fa = 1469598103934665603ull;
+			uint64_t g31_fb = 1469598103934665603ull;
+			size_t g31_za = 0;
+			size_t g31_zb = 0;
+			for (size_t g31_i = 0; g31_i < g31_half; g31_i++)
+			{
+				g31_fa ^= g31_vram[g31_i];
+				g31_fa *= 1099511628211ull;
+				g31_za += g31_vram[g31_i] != 0;
+				g31_fb ^= g31_vram[g31_half + g31_i];
+				g31_fb *= 1099511628211ull;
+				g31_zb += g31_vram[g31_half + g31_i] != 0;
+			}
+			LOGI("G31: bytes seq=%u A fnv=%016llx nz=%u head=%02x%02x%02x%02x%02x%02x%02x%02x B fnv=%016llx nz=%u head=%02x%02x%02x%02x%02x%02x%02x%02x.\n",
+			     g31_seq, (unsigned long long)g31_fa, (unsigned)g31_za,
+			     g31_vram[0], g31_vram[1], g31_vram[2], g31_vram[3],
+			     g31_vram[4], g31_vram[5], g31_vram[6], g31_vram[7],
+			     (unsigned long long)g31_fb, (unsigned)g31_zb,
+			     g31_vram[g31_half], g31_vram[g31_half + 1], g31_vram[g31_half + 2], g31_vram[g31_half + 3],
+			     g31_vram[g31_half + 4], g31_vram[g31_half + 5], g31_vram[g31_half + 6], g31_vram[g31_half + 7]);
+		}
+		else
+		{
+			LOGI("G31: bytes seq=%u map failed.\n", g31_seq);
+		}
+		g31_seq++;
+	}
 
 	if (hacks.backbuffer_promotion && result.image)
 	{

@@ -1,0 +1,40 @@
+#version 450
+
+// One invocation per 16x16 tile; invocation zero checks a known checkerboard.
+layout(local_size_x = 32) in;
+layout(set = 0, binding = 0) uniform sampler2D scanout_image;
+layout(set = 0, binding = 1) uniform sampler2D control_image;
+layout(set = 0, binding = 2, std430) writeonly buffer Counts { uint count[]; } result;
+layout(push_constant) uniform Dimensions { uint width; uint height; } dims;
+
+bool occupied(sampler2D source, ivec2 pixel)
+{
+    vec3 rgb = texelFetch(source, pixel, 0).rgb;
+    return max(max(rgb.r, rgb.g), rgb.b) * 255.0 >= 31.5;
+}
+
+void main()
+{
+    uint index = gl_GlobalInvocationID.x;
+    uint tiles_x = dims.width / 16u;
+    uint tiles_y = dims.height / 16u;
+    if (index > tiles_x * tiles_y)
+        return;
+
+    uint hits = 0u;
+    if (index == 0u)
+    {
+        for (int y = 0; y < 16; ++y)
+            for (int x = 0; x < 16; ++x)
+                hits += uint(occupied(control_image, ivec2(x, y)));
+    }
+    else
+    {
+        uint tile = index - 1u;
+        ivec2 origin = ivec2(int(tile % tiles_x) * 16, int(tile / tiles_x) * 16);
+        for (int y = 0; y < 16; ++y)
+            for (int x = 0; x < 16; ++x)
+                hits += uint(occupied(scanout_image, origin + ivec2(x, y)));
+    }
+    result.count[index] = hits;
+}

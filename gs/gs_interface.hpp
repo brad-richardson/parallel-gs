@@ -155,6 +155,9 @@ struct DebugMode
 struct VSyncInfo
 {
 	uint32_t phase;
+	// Retain the CRTC and merged field images for one diagnostic scanout.
+	bool capture_scanout_stages;
+	bool capture_selected_input;
 	VkImageLayout dst_layout;
 	VkPipelineStageFlags2 dst_stage;
 	VkAccessFlags2 dst_access;
