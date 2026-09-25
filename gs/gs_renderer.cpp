@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: LGPL-3.0+
 
 #include "gs_renderer.hpp"
+#include "pgs_env_knobs.hpp"
 #include "logging.hpp"
 #include "gs_interface.hpp"
 #include "gs_registers_debug.hpp"
@@ -1819,9 +1820,16 @@ void GSRenderer::allocate_scratch_buffers(Vulkan::CommandBuffer &cmd, const Rend
 uint32_t GSRenderer::get_target_hierarchical_binning(
 		uint32_t num_primitives, uint32_t coarse_tiles_width, uint32_t coarse_tiles_height) const
 {
+	// GB9 knob 1: PGS_HIER_BINNING=force|auto|off (unset = today's behavior).
+	// force runs the standard hier-if-large rule on every platform, so the
+	// Mac runs the Odin's binning rule; off forces flat everywhere.
+	const PgsHierBinningMode hier_mode = pgs_hier_binning_mode();
+	if (hier_mode == PgsHierBinningMode::Off)
+		return 1;
 #ifdef __APPLE__
 	// Broken Metal drivers can't deal with the hierarchical binning for some reason.
-	return 1;
+	if (hier_mode != PgsHierBinningMode::Force)
+		return 1;
 #endif
 
 	// Only bother for large number of primitives.
