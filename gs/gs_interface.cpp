@@ -4440,6 +4440,72 @@ bool GSInterface::write_clut_state(const std::vector<uint8_t> &data, uint32_t ba
 	return true;
 }
 
+// Packed live vertex: every field vertex_kick writes, no padding
+// (VertexPosition::padding is never written, so a raw copy would carry
+// uninitialized bytes into the state).
+struct SS3SavedVertex
+{
+	int32_t x, y;
+	uint32_t z;
+	float s, t, q;
+	uint32_t rgba;
+	float fog;
+	uint16_t u, v;
+};
+static_assert(sizeof(SS3SavedVertex) == 36, "SS3SavedVertex must be padding-free");
+
+bool GSInterface::read_vertex_queue_state(std::vector<uint8_t> &data) const
+{
+	if (vertex_queue.count > 3)
+		return false;
+	data.resize(sizeof(uint32_t) + size_t(vertex_queue.count) * sizeof(SS3SavedVertex));
+	uint32_t count = vertex_queue.count;
+	std::memcpy(data.data(), &count, sizeof(count));
+	auto *dst = reinterpret_cast<SS3SavedVertex *>(data.data() + sizeof(count));
+	for (uint32_t i = 0; i < vertex_queue.count; i++)
+	{
+		dst[i].x = vertex_queue.pos[i].pos.x;
+		dst[i].y = vertex_queue.pos[i].pos.y;
+		dst[i].z = vertex_queue.pos[i].z;
+		dst[i].s = vertex_queue.attr[i].st.x;
+		dst[i].t = vertex_queue.attr[i].st.y;
+		dst[i].q = vertex_queue.attr[i].q;
+		dst[i].rgba = vertex_queue.attr[i].rgba;
+		dst[i].fog = vertex_queue.attr[i].fog;
+		dst[i].u = vertex_queue.attr[i].uv.x;
+		dst[i].v = vertex_queue.attr[i].uv.y;
+	}
+	return true;
+}
+
+bool GSInterface::write_vertex_queue_state(const std::vector<uint8_t> &data)
+{
+	if (data.size() < sizeof(uint32_t) ||
+	    (data.size() - sizeof(uint32_t)) % sizeof(SS3SavedVertex) != 0)
+		return false;
+	uint32_t count;
+	std::memcpy(&count, data.data(), sizeof(count));
+	if (count > 3 || data.size() != sizeof(uint32_t) + size_t(count) * sizeof(SS3SavedVertex))
+		return false;
+	const auto *src = reinterpret_cast<const SS3SavedVertex *>(data.data() + sizeof(count));
+	for (uint32_t i = 0; i < count; i++)
+	{
+		vertex_queue.pos[i].pos.x = src[i].x;
+		vertex_queue.pos[i].pos.y = src[i].y;
+		vertex_queue.pos[i].z = src[i].z;
+		vertex_queue.pos[i].padding = 0;
+		vertex_queue.attr[i].st.x = src[i].s;
+		vertex_queue.attr[i].st.y = src[i].t;
+		vertex_queue.attr[i].q = src[i].q;
+		vertex_queue.attr[i].rgba = src[i].rgba;
+		vertex_queue.attr[i].fog = src[i].fog;
+		vertex_queue.attr[i].uv.x = src[i].u;
+		vertex_queue.attr[i].uv.y = src[i].v;
+	}
+	vertex_queue.count = count;
+	return true;
+}
+
 RegisterState &GSInterface::get_register_state()
 {
 	return registers;

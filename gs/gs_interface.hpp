@@ -300,6 +300,15 @@ public:
 	                     uint32_t &iface_instance, uint32_t &iface_latest);
 	bool write_clut_state(const std::vector<uint8_t> &data, uint32_t base_instance, uint32_t next_instance,
 	                      uint32_t iface_instance, uint32_t iface_latest);
+	// ssx3 SS3 S3: partial GS input at the save point. A host->local transfer
+	// in flight keeps its payload/cursors out of the state, so the saver
+	// defers while one is live. Retained strip/fan vertices are plain data
+	// and travel with the state: [u32 count][count packed entries]; count 0
+	// is the empty queue. Present with the S2 overloads above.
+#define PARALLEL_GS_HAS_SAVESTATE_V3 1
+	bool gs_transfer_idle() const { return !transfer_state.host_to_local_active; }
+	bool read_vertex_queue_state(std::vector<uint8_t> &data) const;
+	bool write_vertex_queue_state(const std::vector<uint8_t> &data);
 	RegisterState &get_register_state();
 	const RegisterState &get_register_state() const;
 
