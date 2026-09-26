@@ -341,6 +341,9 @@ public:
 
 	void set_field_aware_super_sampling(bool enable);
 
+	// SC1 (C): persist the VkPipelineCache to PGS_PIPELINE_CACHE.
+	bool save_pipeline_cache();
+
 private:
 	SyncCounters sync_counters;
 
@@ -565,8 +568,23 @@ private:
 	void drain_compilation_tasks();
 	void drain_compilation_tasks_nonblock();
 	void kick_compilation_tasks();
+	// SC1 (B): precompile only the variant keys listed in the file at path.
+	// Returns false when the file cannot be read (caller falls back to the
+	// full set). Unknown programs and malformed lines are skipped; variants
+	// missed here still compile on demand at runtime.
+	bool kick_list_precompile_tasks(const char *path);
 	std::atomic_bool compilation_tasks_active;
 	std::vector<std::future<void>> compilation_tasks;
+
+	// SC1 (A): with PGS_VARIANT_LOG=1, logs the program hash -> name table.
+	void log_known_programs();
+
+	// SC1 (C): persistent VkPipelineCache. Load runs at init when
+	// PGS_PIPELINE_CACHE=<path>; save runs after the precompile drains and
+	// periodically from vsync, plus on explicit request (Android pause/exit).
+	void maybe_load_pipeline_cache(Vulkan::Device *dev);
+	void maybe_save_pipeline_cache_after_precompile();
+	bool pipeline_cache_save_pending = false;
 
 	uint64_t query_timeline(const Vulkan::SemaphoreHolder &sem) const;
 

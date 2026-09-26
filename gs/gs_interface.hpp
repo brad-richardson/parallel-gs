@@ -195,6 +195,10 @@ struct VSyncInfo
 	// If using interlaced, defer any attempt to deinterlace and just return the raw output as-is with phase information.
 	// User is responsible for deinterlacing in whatever way is appropriate.
 	bool skip_deinterlace;
+
+	// SC1 (A): optional guest tick for [pgs-variant] log lines. 0 (unknown)
+	// falls back to the interface's own vsync counter.
+	uint64_t debug_tick = 0;
 };
 
 struct GSOptions
@@ -327,6 +331,12 @@ public:
 	FlushStats consume_flush_stats();
 	double get_accumulated_timestamps(TimestampType type) const;
 
+	// SC1 (C): persist the VkPipelineCache to PGS_PIPELINE_CACHE (no-op when
+	// unset). Safe to call from the application on pause/exit; the renderer
+	// also saves autonomously after the precompile drains and every 3600
+	// vsyncs.
+	bool save_pipeline_cache();
+
 	void read_transfer_fifo(void *data, uint32_t num_128b_words);
 
 private:
@@ -347,6 +357,10 @@ private:
 	PageTracker tracker;
 	GSRenderer renderer;
 	uint32_t vram_size = 0;
+	// SC1 (A/C): vsync counter (variant-log tick fallback) and whether the
+	// periodic pipeline-cache save is armed (PGS_PIPELINE_CACHE set at init).
+	uint64_t vsync_counter = 0;
+	bool pipeline_cache_save_armed = false;
 	DebugMode debug_mode;
 	Hacks hacks;
 

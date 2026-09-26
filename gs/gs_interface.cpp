@@ -10,6 +10,7 @@
 #include "muglm/muglm_impl.hpp"
 #include "gs_registers_debug.hpp"
 #include <cstring>
+#include <cstdlib>
 
 namespace ParallelGS
 {
@@ -51,6 +52,13 @@ bool GSInterface::init(Vulkan::Device *device, const GSOptions &options)
 
 	if (!renderer.init(device, options))
 		return false;
+
+	// SC1 (C): arm the periodic save once; the path itself is re-read from
+	// the environment on every save.
+	{
+		const char *cache_path = getenv("PGS_PIPELINE_CACHE");
+		pipeline_cache_save_armed = cache_path && cache_path[0];
+	}
 
 	set_super_sampling_rate(options.super_sampling,
 	                        options.ordered_super_sampling,
@@ -4734,8 +4742,21 @@ void GSInterface::register_backbuffer_promotion_fbp(uint32_t fbp)
 	num_promoted_backbuffers++;
 }
 
+bool GSInterface::save_pipeline_cache()
+{
+	return renderer.save_pipeline_cache();
+}
+
 ScanoutResult GSInterface::vsync(const VSyncInfo &info_)
 {
+	vsync_counter++;
+	// SC1 (A): stamp on-demand compiles with the guest tick when the
+	// application provides one, else this interface's vsync count.
+	Vulkan::CommandBuffer::set_variant_log_tick(info_.debug_tick ? info_.debug_tick : vsync_counter);
+	// SC1 (C): ~60 s cadence; vkGetPipelineCacheData + a file write.
+	if (pipeline_cache_save_armed && (vsync_counter % 3600) == 0)
+		renderer.save_pipeline_cache();
+
 	auto info = info_;
 	auto ffmd = priv_registers.smode2.FFMD;
 

@@ -5,7 +5,14 @@
 
 #include "gs_renderer.hpp"
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cerrno>
+#include <future>
+#include <vector>
 #include "pgs_env_knobs.hpp"
+#include "pgs_shader_variants.hpp"
 #include "logging.hpp"
 #include "gs_interface.hpp"
 #include "gs_registers_debug.hpp"
@@ -456,8 +463,327 @@ bool GSRenderer::can_potentially_super_sample() const
 	return buffers.gpu->get_create_info().size > vram_size * 2;
 }
 
+void GSRenderer::log_known_programs()
+{
+	const char *env = getenv("PGS_VARIANT_LOG");
+	if (!env || strcmp(env, "1") != 0)
+		return;
+
+	struct Entry { const Vulkan::Program *prog; const char *name; };
+	char ubershader_names[2][2][24];
+	char upload_names[2][16];
+	char sample_names[2][20];
+	Entry entries[4 + 2 + 8 + 1 + 2 + 1];
+	size_t count = 0;
+	auto add = [&](const Vulkan::Program *prog, const char *name) {
+		if (prog && count < sizeof(entries) / sizeof(entries[0]))
+			entries[count++] = { prog, name };
+	};
+
+	for (unsigned i = 0; i < 2; i++)
+		for (unsigned j = 0; j < 2; j++)
+		{
+			snprintf(ubershader_names[i][j], sizeof(ubershader_names[i][j]), "ubershader[%u][%u]", i, j);
+			add(shaders.ubershader[i][j], ubershader_names[i][j]);
+		}
+	for (unsigned i = 0; i < 2; i++)
+	{
+		snprintf(upload_names[i], sizeof(upload_names[i]), "upload[%u]", i);
+		add(shaders.upload[i], upload_names[i]);
+	}
+	add(shaders.clut_write, "clut_write");
+	add(shaders.vram_copy, "vram_copy");
+	add(shaders.triangle_setup, "triangle_setup");
+	add(shaders.single_sample_heuristic, "single_sample_heuristic");
+	add(shaders.extwrite, "extwrite");
+	add(shaders.qword_clear, "qword_clear");
+	add(shaders.sampler_feedback, "sampler_feedback");
+	add(shaders.binning, "binning");
+	add(blit_quad, "blit_quad");
+	for (unsigned i = 0; i < 2; i++)
+	{
+		snprintf(sample_names[i], sizeof(sample_names[i]), "sample_quad[%u]", i);
+		add(sample_quad[i], sample_names[i]);
+	}
+	add(weave_quad, "weave_quad");
+
+	for (size_t i = 0; i < count; i++)
+	{
+		// De-duplicate: several slots may share one Program.
+		bool seen = false;
+		for (size_t j = 0; j < i; j++)
+			seen = seen || entries[j].prog == entries[i].prog;
+		if (!seen)
+		{
+			LOGI("[pgs-variant-prog] hash=%016llx name=%s\n",
+			     static_cast<unsigned long long>(entries[i].prog->get_hash()),
+			     entries[i].name);
+		}
+	}
+}
+
+void GSRenderer::maybe_load_pipeline_cache(Vulkan::Device *dev)
+{
+	const char *path = getenv("PGS_PIPELINE_CACHE");
+	if (!path || !path[0] || !dev)
+		return;
+
+	std::vector<uint8_t> data;
+	FILE *f = fopen(path, "rb");
+	if (f)
+	{
+		fseek(f, 0, SEEK_END);
+		long size = ftell(f);
+		fseek(f, 0, SEEK_SET);
+		if (size > 0)
+		{
+			data.resize(size_t(size));
+			size_t got = fread(data.data(), 1, data.size(), f);
+			if (got != data.size())
+				data.clear();
+		}
+		fclose(f);
+	}
+
+	// init_pipeline_cache validates the UUID + content hash header itself
+	// and falls back to a fresh cache on mismatch or corruption.
+	if (!data.empty())
+		LOGI("[pgs-pcache] loading %zu bytes from %s\n", data.size(), path);
+	else
+		LOGI("[pgs-pcache] no cache at %s, starting fresh\n", path);
+	if (!dev->init_pipeline_cache(data.empty() ? nullptr : data.data(), data.size()))
+		LOGW("[pgs-pcache] init_pipeline_cache failed\n");
+}
+
+bool GSRenderer::save_pipeline_cache()
+{
+	const char *path = getenv("PGS_PIPELINE_CACHE");
+	if (!path || !path[0] || !device)
+		return false;
+
+	size_t size = device->get_pipeline_cache_size();
+	if (!size)
+	{
+		LOGW("[pgs-pcache] get_pipeline_cache_size failed\n");
+		return false;
+	}
+
+	std::vector<uint8_t> data(size);
+	if (!device->get_pipeline_cache_data(data.data(), size))
+	{
+		LOGW("[pgs-pcache] get_pipeline_cache_data failed\n");
+		return false;
+	}
+
+	FILE *f = fopen(path, "wb");
+	if (!f)
+	{
+		LOGW("[pgs-pcache] cannot write %s: %s\n", path, strerror(errno));
+		return false;
+	}
+	size_t wrote = fwrite(data.data(), 1, size, f);
+	fclose(f);
+	if (wrote != size)
+	{
+		LOGW("[pgs-pcache] short write to %s (%zu of %zu)\n", path, wrote, size);
+		return false;
+	}
+
+	LOGI("[pgs-pcache] saved %zu bytes to %s\n", size, path);
+	return true;
+}
+
+void GSRenderer::maybe_save_pipeline_cache_after_precompile()
+{
+	if (!pipeline_cache_save_pending || !compilation_tasks.empty())
+		return;
+	pipeline_cache_save_pending = false;
+	save_pipeline_cache();
+}
+
+bool GSRenderer::kick_list_precompile_tasks(const char *path)
+{
+	FILE *f = fopen(path, "r");
+	if (!f)
+	{
+		LOGW("[pgs-precomp] cannot read %s: %s\n", path, strerror(errno));
+		return false;
+	}
+
+	struct KnownProgram { Util::Hash hash; Vulkan::Program *prog; };
+	KnownProgram known[4 + 2 + 8];
+	size_t num_known = 0;
+	auto add_known = [&](Vulkan::Program *prog) {
+		if (prog && num_known < sizeof(known) / sizeof(known[0]))
+			known[num_known++] = { prog->get_hash(), prog };
+	};
+	for (unsigned i = 0; i < 2; i++)
+		for (unsigned j = 0; j < 2; j++)
+			add_known(shaders.ubershader[i][j]);
+	for (unsigned i = 0; i < 2; i++)
+		add_known(shaders.upload[i]);
+	add_known(shaders.clut_write);
+	add_known(shaders.vram_copy);
+	add_known(shaders.triangle_setup);
+	add_known(shaders.single_sample_heuristic);
+	add_known(shaders.extwrite);
+	add_known(shaders.qword_clear);
+	add_known(shaders.sampler_feedback);
+	add_known(shaders.binning);
+
+	std::vector<Vulkan::DeferredPipelineCompile> tasks;
+	char line[1024];
+	size_t num_lines = 0, num_queued = 0, num_graphics = 0, num_unknown = 0,
+	       num_malformed = 0, num_ispec = 0, num_unsupported = 0, num_warnings = 0;
+
+	auto cmd = device->request_command_buffer();
+	while (fgets(line, sizeof(line), f))
+	{
+		num_lines++;
+		// Skip blank lines and comments.
+		const char *p = line;
+		while (*p == ' ' || *p == '\t')
+			p++;
+		if (*p == '\0' || *p == '\r' || *p == '\n' || *p == '#')
+			continue;
+
+		PgsVariantKey key;
+		bool is_graphics = false;
+		if (!pgs_parse_variant_key(p, key, is_graphics))
+		{
+			if (is_graphics)
+				num_graphics++;
+			else
+			{
+				num_malformed++;
+				if (num_warnings++ < 5)
+					LOGW("[pgs-precomp] malformed line %zu, skipping\n", num_lines);
+			}
+			continue;
+		}
+		if (key.ispec_mask)
+		{
+			// Internal spec constants only come from graphics prerotate
+			// state; compute variants never carry them.
+			num_ispec++;
+			if (num_warnings++ < 5)
+				LOGW("[pgs-precomp] line %zu has internal spec constants, skipping\n", num_lines);
+			continue;
+		}
+
+		Vulkan::Program *prog = nullptr;
+		for (size_t i = 0; i < num_known; i++)
+		{
+			if (known[i].hash == key.prog_hash)
+			{
+				prog = known[i].prog;
+				break;
+			}
+		}
+		if (!prog)
+		{
+			num_unknown++;
+			if (num_warnings++ < 5)
+			{
+				LOGW("[pgs-precomp] line %zu: unknown program %016llx, skipping (compiles on demand)\n",
+				     num_lines, static_cast<unsigned long long>(key.prog_hash));
+			}
+			continue;
+		}
+
+		if (key.sg_control &&
+		    !device->supports_subgroup_size_log2(key.sg_full_group != 0,
+		                                         uint8_t(key.sg_min_log2),
+		                                         uint8_t(key.sg_max_log2),
+		                                         VK_SHADER_STAGE_COMPUTE_BIT))
+		{
+			num_unsupported++;
+			if (num_warnings++ < 5)
+			{
+				LOGW("[pgs-precomp] line %zu: subgroup config %u:%u:%u unsupported here, skipping\n",
+				     num_lines, key.sg_min_log2, key.sg_max_log2, key.sg_full_group);
+			}
+			continue;
+		}
+
+		// Rebuild the exact pipeline state the key was recorded from: same
+		// program, spec mask/values, subgroup state and robustness produce
+		// the same hash and the same VkComputePipelineCreateInfo as an
+		// on-demand compile, so the program cache hit lands identically.
+		cmd->set_program(prog);
+		cmd->set_specialization_constant_mask(key.spec_mask);
+		for (uint32_t id = 0; id < 8; id++)
+			cmd->set_specialization_constant(id, (key.spec_mask & (1u << id)) ? key.specs[id] : 0u);
+		cmd->enable_subgroup_size_control(key.sg_control != 0);
+		cmd->set_subgroup_size_log2(key.sg_full_group != 0,
+		                             uint8_t(key.sg_min_log2), uint8_t(key.sg_max_log2));
+		cmd->set_robustness(key.robust != 0);
+
+		Vulkan::DeferredPipelineCompile deferred = {};
+		cmd->extract_pipeline_state(deferred);
+		tasks.push_back(deferred);
+		num_queued++;
+	}
+	fclose(f);
+	device->submit_discard(cmd);
+
+	long num_threads = 2;
+	if (const char *threads_env = getenv("PGS_PRECOMPILE_THREADS"))
+	{
+		char *end = nullptr;
+		long parsed = strtol(threads_env, &end, 10);
+		if (end != threads_env && parsed >= 1 && parsed <= 64)
+			num_threads = parsed;
+		else
+			LOGW("[pgs-precomp] bad PGS_PRECOMPILE_THREADS=%s, using 2\n", threads_env);
+	}
+
+	compilation_tasks_active = true;
+	size_t num_tasks = tasks.size();
+	// Spread the remainder over the first threads so no listed task is dropped.
+	for (long thread_index = 0; thread_index < num_threads; thread_index++)
+	{
+		size_t begin = (num_tasks * size_t(thread_index)) / size_t(num_threads);
+		size_t end = (num_tasks * size_t(thread_index + 1)) / size_t(num_threads);
+		std::vector<Vulkan::DeferredPipelineCompile> deferred(tasks.begin() + begin, tasks.begin() + end);
+
+		auto async_task = std::async(std::launch::async, [this, moved_tasks = std::move(deferred)]() {
+			Util::register_thread_index(0);
+			Util::set_current_thread_name("PgsPrecomp");
+			for (auto &task: moved_tasks)
+			{
+				if (!compilation_tasks_active)
+					break;
+				Vulkan::CommandBuffer::build_compute_pipeline(
+						device, task, Vulkan::CommandBuffer::CompileMode::AsyncThread);
+			}
+		});
+
+		compilation_tasks.push_back(std::move(async_task));
+	}
+
+	const char *cache_path = getenv("PGS_PIPELINE_CACHE");
+	pipeline_cache_save_pending = cache_path && cache_path[0];
+	LOGI("[pgs-precomp] list %s: %zu lines, %zu queued on %ld threads "
+	     "(%zu graphics, %zu unknown program, %zu malformed, %zu internal-spec, %zu unsupported subgroup)\n",
+	     path, num_lines, num_queued, num_threads,
+	     num_graphics, num_unknown, num_malformed, num_ispec, num_unsupported);
+	return true;
+}
+
 void GSRenderer::kick_compilation_tasks()
 {
+	// SC1 (B): an explicit list replaces the full ~3,000-variant fan-out.
+	// Precedence: list > skip > full. A missing list file falls back to the
+	// full set (today's behavior).
+	if (const char *list = getenv("PGS_PRECOMPILE_LIST"))
+	{
+		if (list[0] && kick_list_precompile_tasks(list))
+			return;
+		if (list[0])
+			LOGW("[pgs-precomp] falling back to the full variant set\n");
+	}
+
 	const char *env = getenv("PGS_SKIP_COMPILATION_TASKS");
 	if (env && strcmp(env, "1") == 0)
 	{
@@ -753,6 +1079,9 @@ void GSRenderer::kick_compilation_tasks()
 
 		compilation_tasks.push_back(std::move(async_task));
 	}
+
+	const char *cache_path = getenv("PGS_PIPELINE_CACHE");
+	pipeline_cache_save_pending = cache_path && cache_path[0];
 }
 
 GSRenderer::GSRenderer(PageTracker &tracker_)
@@ -788,6 +1117,9 @@ GSRenderer::GSRenderer(PageTracker &tracker_)
 bool GSRenderer::init(Vulkan::Device *device_, const GSOptions &options)
 {
 	drain_compilation_tasks();
+	// SC1 (C): after the drain (old threads joined) but before any new
+	// command buffer (and its captured cache handle) exists.
+	maybe_load_pipeline_cache(device_);
 
 	Vulkan::ResourceLayout layout;
 	shaders = Shaders<>(*device_, layout, 0);
@@ -795,6 +1127,7 @@ bool GSRenderer::init(Vulkan::Device *device_, const GSOptions &options)
 	sample_quad[0] = device_->request_program(shaders.quad, shaders.sample_circuit[0]);
 	sample_quad[1] = device_->request_program(shaders.quad, shaders.sample_circuit[1]);
 	weave_quad = device_->request_program(shaders.quad, shaders.weave);
+	log_known_programs();
 
 	flush_submit(0);
 	// Descriptor indexing is a hard requirement, but timeline semaphore could be elided if really needed.
@@ -1233,6 +1566,8 @@ void GSRenderer::flush_submit(uint64_t value)
 
 	// This is a delayed sync-point between CPU and GPU, and garbage collection can happen here.
 	drain_compilation_tasks_nonblock();
+	// SC1 (C): the precompile just finished -> persist what it built.
+	maybe_save_pipeline_cache_after_precompile();
 
 	// If we have a timeline trace, we'd like it to be somewhat readable.
 	// Only do garbage collection at frame boundaries.

@@ -7,6 +7,7 @@ add_library(parallel-gs STATIC
         gs_registers.hpp
         gs_registers_debug.hpp
         gs_register_addr.hpp
+        pgs_shader_variants.cpp pgs_shader_variants.hpp
         gs_interface.cpp gs_interface.hpp
         gs_util.cpp gs_util.hpp
         shaders/slangmosh_iface.hpp shaders/slangmosh.hpp
