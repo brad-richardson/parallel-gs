@@ -5215,4 +5215,68 @@ Vulkan::ImageHandle GSRenderer::fastmad_deinterlace(Vulkan::CommandBuffer &cmd, 
 	cmd.end_region();
 	return deinterlaced;
 }
+
+bool GSRenderer::read_clut_state(void *data, size_t size, uint32_t &base_instance, uint32_t &next_instance)
+{
+	if (!device || !data || size != size_t(CLUTInstances) * CLUTSize || !palette_uploads.empty())
+		return false;
+	flush_submit(0);
+
+	Vulkan::BufferCreateInfo info = {};
+	info.size = size;
+	info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+	info.domain = Vulkan::BufferDomain::CachedHost;
+	auto readback = device->create_buffer(info);
+
+	auto cmd = device->request_command_buffer();
+	cmd->begin_region("ssx3-clut-readback");
+	cmd->barrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
+	             VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+	cmd->copy_buffer(*readback, *buffers.clut);
+	cmd->barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+	             VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
+	cmd->end_region();
+	Vulkan::Fence fence;
+	device->submit(cmd, &fence);
+	fence->wait();
+
+	const void *mapped = device->map_host_buffer(*readback, Vulkan::MEMORY_ACCESS_READ_BIT);
+	if (!mapped)
+		return false;
+	memcpy(data, mapped, size);
+	device->unmap_host_buffer(*readback, Vulkan::MEMORY_ACCESS_READ_BIT);
+	base_instance = base_clut_instance;
+	next_instance = next_clut_instance;
+	return true;
+}
+
+bool GSRenderer::write_clut_state(const void *data, size_t size, uint32_t base_instance, uint32_t next_instance)
+{
+	if (!device || !data || size != size_t(CLUTInstances) * CLUTSize ||
+	    base_instance >= CLUTInstances || next_instance >= CLUTInstances || !palette_uploads.empty())
+		return false;
+	flush_submit(0);
+
+	Vulkan::BufferCreateInfo info = {};
+	info.size = size;
+	info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+	info.domain = Vulkan::BufferDomain::CachedHost;
+	auto staging = device->create_buffer(info, data);
+
+	auto cmd = device->request_command_buffer();
+	cmd->begin_region("ssx3-clut-upload");
+	cmd->barrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+	             VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+	cmd->copy_buffer(*buffers.clut, *staging);
+	cmd->barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+	             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+	cmd->end_region();
+	Vulkan::Fence fence;
+	device->submit(cmd, &fence);
+	fence->wait();
+
+	base_clut_instance = base_instance;
+	next_clut_instance = next_instance;
+	return true;
+}
 }

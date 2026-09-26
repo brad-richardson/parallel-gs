@@ -4406,6 +4406,19 @@ void GSInterface::gif_transfer(uint32_t path_index, const void *data, size_t siz
 	}
 }
 
+bool GSInterface::read_clut_state(std::vector<uint8_t> &data, uint32_t &base_instance, uint32_t &next_instance)
+{
+	flush();
+	data.resize(size_t(CLUTInstances) * CLUTSize);
+	return renderer.read_clut_state(data.data(), data.size(), base_instance, next_instance);
+}
+
+bool GSInterface::write_clut_state(const std::vector<uint8_t> &data, uint32_t base_instance, uint32_t next_instance)
+{
+	flush();
+	return renderer.write_clut_state(data.data(), data.size(), base_instance, next_instance);
+}
+
 RegisterState &GSInterface::get_register_state()
 {
 	return registers;

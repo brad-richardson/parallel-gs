@@ -302,6 +302,13 @@ public:
 
 	// Cache management mostly on GPUs that need it.
 	void *begin_host_vram_access();
+
+	// ssx3 SS1 save states: the CLUT ring (CLUTInstances x CLUTSize bytes,
+	// GPU-only) plus its instance cursors. Call after a flush with no palette
+	// uploads pending; both block until the GPU copy completes.
+	bool clut_state_idle() const { return palette_uploads.empty(); }
+	bool read_clut_state(void *data, size_t size, uint32_t &base_instance, uint32_t &next_instance);
+	bool write_clut_state(const void *data, size_t size, uint32_t base_instance, uint32_t next_instance);
 	void end_host_write_vram_access();
 
 	ScanoutResult vsync(const PrivRegisterState &priv, const VSyncInfo &info,

@@ -286,6 +286,12 @@ public:
 
 	void clobber_register_state();
 
+	// ssx3 SS1 save states: CLUT ring + cursors (GSRenderer::read/write_clut_state).
+#define PARALLEL_GS_HAS_CLUT_STATE 1
+	// False while palette uploads wait for the next render pass (save later).
+	bool clut_state_idle() const { return renderer.clut_state_idle(); }
+	bool read_clut_state(std::vector<uint8_t> &data, uint32_t &base_instance, uint32_t &next_instance);
+	bool write_clut_state(const std::vector<uint8_t> &data, uint32_t base_instance, uint32_t next_instance);
 	RegisterState &get_register_state();
 	const RegisterState &get_register_state() const;
 
