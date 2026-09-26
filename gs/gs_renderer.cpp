@@ -1132,6 +1132,15 @@ void GSRenderer::flush_submit(uint64_t value)
 	if (!device)
 		return;
 	sync_counters.flush_submits.fetch_add(1, std::memory_order_relaxed);
+	struct FsScope
+	{
+		std::atomic<uint64_t> &ns; std::chrono::steady_clock::time_point t0;
+		~FsScope()
+		{
+			ns.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+					std::chrono::steady_clock::now() - t0).count()), std::memory_order_relaxed);
+		}
+	} fs_scope{sync_counters.flush_submit_ns, std::chrono::steady_clock::now()};
 
 	Vulkan::QueryPoolHandle start_ts, end_ts;
 	if (enable_timestamps)

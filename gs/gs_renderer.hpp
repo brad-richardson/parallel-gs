@@ -303,6 +303,7 @@ public:
 		std::atomic<uint64_t> frame_context_ns{0}; // wall in next_frame_context (waits for the recycled context's fences)
 		std::atomic<uint64_t> timeline_waits{0};
 		std::atomic<uint64_t> timeline_wait_ns{0};
+		std::atomic<uint64_t> flush_submit_ns{0}; // wall of the whole flush_submit (submits + frame-context advance)
 	};
 	const SyncCounters &get_sync_counters() const { return sync_counters; }
 
