@@ -9,6 +9,7 @@
 #include "shaders/swizzle_utils.h"
 #include "muglm/muglm_impl.hpp"
 #include "gs_registers_debug.hpp"
+#include <cstring>
 
 namespace ParallelGS
 {
