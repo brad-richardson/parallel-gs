@@ -295,6 +295,17 @@ public:
 	// Submit to GPU and signal when done.
 	void flush_submit(uint64_t timeline);
 
+	// ssx3 VK1 Part 2A: CPU-side sync counters (cumulative; read from any thread).
+	struct SyncCounters
+	{
+		std::atomic<uint64_t> flush_submits{0};
+		std::atomic<uint64_t> frame_context_advances{0};
+		std::atomic<uint64_t> frame_context_ns{0}; // wall in next_frame_context (waits for the recycled context's fences)
+		std::atomic<uint64_t> timeline_waits{0};
+		std::atomic<uint64_t> timeline_wait_ns{0};
+	};
+	const SyncCounters &get_sync_counters() const { return sync_counters; }
+
 	// Wait until timeline reaches value. After waiting, it may be safe to read from host VRAM.
 	void wait_timeline(uint64_t value);
 	// Query current timeline value.
@@ -330,6 +341,8 @@ public:
 	void set_field_aware_super_sampling(bool enable);
 
 private:
+	SyncCounters sync_counters;
+
 	PageTracker &tracker;
 	Vulkan::Device *device = nullptr;
 	Vulkan::CommandBufferHandle direct_cmd;

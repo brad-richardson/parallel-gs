@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: LGPL-3.0+
 
 #include "gs_renderer.hpp"
+#include <chrono>
 #include "pgs_env_knobs.hpp"
 #include "logging.hpp"
 #include "gs_interface.hpp"
@@ -1052,6 +1053,18 @@ GSRenderer::~GSRenderer()
 
 void GSRenderer::wait_timeline(uint64_t value)
 {
+	const auto tw0 = std::chrono::steady_clock::now();
+	struct TwScope
+	{
+		SyncCounters &c; std::chrono::steady_clock::time_point t0;
+		~TwScope()
+		{
+			c.timeline_waits.fetch_add(1, std::memory_order_relaxed);
+			c.timeline_wait_ns.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+					std::chrono::steady_clock::now() - t0).count()), std::memory_order_relaxed);
+		}
+	} tw_scope{sync_counters, tw0};
+
 	Vulkan::QueryPoolHandle start_ts, end_ts;
 	if (enable_timestamps && device)
 		start_ts = device->write_calibrated_timestamp();
@@ -1118,6 +1131,7 @@ void GSRenderer::flush_submit(uint64_t value)
 {
 	if (!device)
 		return;
+	sync_counters.flush_submits.fetch_add(1, std::memory_order_relaxed);
 
 	Vulkan::QueryPoolHandle start_ts, end_ts;
 	if (enable_timestamps)
@@ -1214,7 +1228,13 @@ void GSRenderer::flush_submit(uint64_t value)
 	// If we have a timeline trace, we'd like it to be somewhat readable.
 	// Only do garbage collection at frame boundaries.
 	if (!device->get_system_handles().timeline_trace_file)
+	{
+		const auto nfc0 = std::chrono::steady_clock::now();
 		device->next_frame_context();
+		sync_counters.frame_context_advances.fetch_add(1, std::memory_order_relaxed);
+		sync_counters.frame_context_ns.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+				std::chrono::steady_clock::now() - nfc0).count()), std::memory_order_relaxed);
+	}
 
 	log_timestamps();
 	check_bug_feedback();

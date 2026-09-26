@@ -298,6 +298,9 @@ public:
 	PrivRegisterState &get_priv_register_state();
 	const PrivRegisterState &get_priv_register_state() const;
 
+	// ssx3 VK1 Part 2A: flush/frame-context/timeline-wait counters.
+	const GSRenderer::SyncCounters &get_sync_counters() const { return renderer.get_sync_counters(); }
+
 	GIFPath &get_gif_path(uint32_t path);
 	const GIFPath &get_gif_path(uint32_t path) const;
 
