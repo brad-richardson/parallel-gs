@@ -4419,6 +4419,27 @@ bool GSInterface::write_clut_state(const std::vector<uint8_t> &data, uint32_t ba
 	return renderer.write_clut_state(data.data(), data.size(), base_instance, next_instance);
 }
 
+bool GSInterface::read_clut_state(std::vector<uint8_t> &data, uint32_t &base_instance, uint32_t &next_instance,
+                                  uint32_t &iface_instance, uint32_t &iface_latest)
+{
+	if (!read_clut_state(data, base_instance, next_instance))
+		return false;
+	iface_instance = render_pass.clut_instance;
+	iface_latest = render_pass.latest_clut_instance;
+	return true;
+}
+
+bool GSInterface::write_clut_state(const std::vector<uint8_t> &data, uint32_t base_instance, uint32_t next_instance,
+                                   uint32_t iface_instance, uint32_t iface_latest)
+{
+	if (!write_clut_state(data, base_instance, next_instance))
+		return false;
+	render_pass.clut_instance = iface_instance;
+	render_pass.latest_clut_instance = iface_latest;
+	render_pass.num_memoized_palettes = 0;
+	return true;
+}
+
 RegisterState &GSInterface::get_register_state()
 {
 	return registers;

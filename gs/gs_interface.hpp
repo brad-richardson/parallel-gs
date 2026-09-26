@@ -292,6 +292,14 @@ public:
 	bool clut_state_idle() const { return renderer.clut_state_idle(); }
 	bool read_clut_state(std::vector<uint8_t> &data, uint32_t &base_instance, uint32_t &next_instance);
 	bool write_clut_state(const std::vector<uint8_t> &data, uint32_t base_instance, uint32_t next_instance);
+	// ssx3 SS3 S2: the same ring/cursors plus the interface's active palette
+	// indices (render_pass.clut_instance/latest_clut_instance). A CLD=0 draw
+	// or partial palette update after a load must see the saved bank, not
+	// bank 0. The write drops memoized palettes (they key off the old indices).
+	bool read_clut_state(std::vector<uint8_t> &data, uint32_t &base_instance, uint32_t &next_instance,
+	                     uint32_t &iface_instance, uint32_t &iface_latest);
+	bool write_clut_state(const std::vector<uint8_t> &data, uint32_t base_instance, uint32_t next_instance,
+	                      uint32_t iface_instance, uint32_t iface_latest);
 	RegisterState &get_register_state();
 	const RegisterState &get_register_state() const;
 
