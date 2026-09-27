@@ -4515,6 +4515,27 @@ bool GSInterface::write_vertex_queue_state(const std::vector<uint8_t> &data)
 	return true;
 }
 
+bool GSInterface::savestate_quiesce()
+{
+	// Established order (post_draw_kick_handler, check_frame_buffer_state):
+	// a received transfer prefix lands before any render-pass flush. The
+	// transfer itself stays open: its missing bytes are guest data the host
+	// must not invent, so the save still defers while one is live.
+	bool flushed = false;
+	if (transfer_state.host_to_local_active &&
+	    transfer_state.host_to_local_payload.size() > transfer_state.last_flushed_qwords)
+	{
+		flush_pending_transfer(true);
+		flushed = true;
+	}
+	if (transfer_state.host_to_local_active)
+		return flushed;
+	if (render_pass.primitive_count == 0 && renderer.clut_state_idle())
+		return flushed;
+	tracker.flush_render_pass(FlushReason::SaveState);
+	return true;
+}
+
 RegisterState &GSInterface::get_register_state()
 {
 	return registers;

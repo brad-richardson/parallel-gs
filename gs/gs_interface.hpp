@@ -313,6 +313,14 @@ public:
 	bool gs_transfer_idle() const { return !transfer_state.host_to_local_active; }
 	bool read_vertex_queue_state(std::vector<uint8_t> &data) const;
 	bool write_vertex_queue_state(const std::vector<uint8_t> &data);
+	// ssx3 SQ1: settle host-side-only pending GS work so a save can land on
+	// any vsync (a palette upload or tail render pass is pending at most
+	// race VBlanks). Applies a received transfer prefix (keep-alive) and
+	// flushes the tail pass through the normal tracker path; true when it
+	// flushed anything. Never invents guest data: an open transfer still
+	// reports busy via gs_transfer_idle().
+#define PARALLEL_GS_HAS_SAVESTATE_QUIESCE 1
+	bool savestate_quiesce();
 	RegisterState &get_register_state();
 	const RegisterState &get_register_state() const;
 

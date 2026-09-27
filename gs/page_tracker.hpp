@@ -127,7 +127,8 @@ enum class FlushReason
 	CopyHazard,
 	SubmissionFlush,
 	PressureFlush,
-	HostAccess
+	HostAccess,
+	SaveState // ssx3 SQ1: savestate_quiesce settles the tail pass before a save
 };
 
 class GSInterface;

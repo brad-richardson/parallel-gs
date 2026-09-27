@@ -3317,6 +3317,8 @@ static const char *reason_to_str(FlushReason reason)
 		return "FBPointer";
 	case FlushReason::HostAccess:
 		return "HostAccess";
+	case FlushReason::SaveState:
+		return "SaveState";
 	default:
 		return "";
 	}
