@@ -321,6 +321,16 @@ public:
 	// reports busy via gs_transfer_idle().
 #define PARALLEL_GS_HAS_SAVESTATE_QUIESCE 1
 	bool savestate_quiesce();
+	// ssx3 SQ1: the in-flight transfer state as plain data, so a save can
+	// land while a transfer is open and the restore resumes it. Layout:
+	// [u8 h2l_active][u32 required_qwords][u32 last_flushed_qwords]
+	// [u64 bitbltbuf][u64 trxpos][u64 trxreg][u64 trxdir][u8 needs_shadow]
+	// [u64 payload_qwords][payload][u64 fifo_bytes][fifo]
+	// [u32 fifo_128b_offset][u32 fifo_128b_size]. The write validates the
+	// exact size and ranges; copy.host_data re-points at the payload.
+#define PARALLEL_GS_HAS_TRANSFER_STATE 1
+	bool read_transfer_state(std::vector<uint8_t> &data) const;
+	bool write_transfer_state(const std::vector<uint8_t> &data);
 	RegisterState &get_register_state();
 	const RegisterState &get_register_state() const;
 

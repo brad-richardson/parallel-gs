@@ -4518,9 +4518,10 @@ bool GSInterface::write_vertex_queue_state(const std::vector<uint8_t> &data)
 bool GSInterface::savestate_quiesce()
 {
 	// Established order (post_draw_kick_handler, check_frame_buffer_state):
-	// a received transfer prefix lands before any render-pass flush. The
-	// transfer itself stays open: its missing bytes are guest data the host
-	// must not invent, so the save still defers while one is live.
+	// a received transfer prefix lands before any render-pass flush. An
+	// open transfer no longer skips the pass flush: its payload/cursors
+	// travel with the state (read/write_transfer_state), so the save
+	// lands and the restore resumes it.
 	bool flushed = false;
 	if (transfer_state.host_to_local_active &&
 	    transfer_state.host_to_local_payload.size() > transfer_state.last_flushed_qwords)
@@ -4528,11 +4529,115 @@ bool GSInterface::savestate_quiesce()
 		flush_pending_transfer(true);
 		flushed = true;
 	}
-	if (transfer_state.host_to_local_active)
-		return flushed;
 	if (render_pass.primitive_count == 0 && renderer.clut_state_idle())
 		return flushed;
 	tracker.flush_render_pass(FlushReason::SaveState);
+	return true;
+}
+
+bool GSInterface::read_transfer_state(std::vector<uint8_t> &data) const
+{
+	data.clear();
+	const auto put = [&data](const void *src, size_t n) {
+		const auto *b = static_cast<const uint8_t *>(src);
+		data.insert(data.end(), b, b + n);
+	};
+	const uint8_t active = transfer_state.host_to_local_active ? 1u : 0u;
+	put(&active, 1u);
+	put(&transfer_state.required_qwords, sizeof(uint32_t));
+	put(&transfer_state.last_flushed_qwords, sizeof(uint32_t));
+	put(&transfer_state.copy.bitbltbuf.bits, sizeof(uint64_t));
+	put(&transfer_state.copy.trxpos.bits, sizeof(uint64_t));
+	put(&transfer_state.copy.trxreg.bits, sizeof(uint64_t));
+	put(&transfer_state.copy.trxdir.bits, sizeof(uint64_t));
+	const uint8_t shadow = transfer_state.copy.needs_shadow_vram ? 1u : 0u;
+	put(&shadow, 1u);
+	const uint64_t payloadQwords = transfer_state.host_to_local_payload.size();
+	put(&payloadQwords, sizeof(payloadQwords));
+	if (payloadQwords)
+		put(transfer_state.host_to_local_payload.data(), size_t(payloadQwords) * sizeof(uint64_t));
+	const uint64_t fifoBytes = uint64_t(transfer_state.fifo_readback_128b_size) * 16u;
+	put(&fifoBytes, sizeof(fifoBytes));
+	if (fifoBytes)
+		put(transfer_state.fifo_readback.data(), size_t(fifoBytes));
+	put(&transfer_state.fifo_readback_128b_offset, sizeof(uint32_t));
+	put(&transfer_state.fifo_readback_128b_size, sizeof(uint32_t));
+	return true;
+}
+
+bool GSInterface::write_transfer_state(const std::vector<uint8_t> &data)
+{
+	// Fixed header: 1 + 4 + 4 + 32 + 1 + 8 + 8 + 4 + 4 = 66 bytes.
+	constexpr size_t kFixed = 66u;
+	constexpr uint64_t kMaxPayloadQwords = 8u * 1024u * 1024u; // 64 MiB
+	constexpr uint64_t kMaxFifoBytes = 64u * 1024u * 1024u;
+	if (data.size() < kFixed)
+		return false;
+	size_t t = 0;
+	const uint8_t active = data[t++];
+	if (active > 1u)
+		return false;
+	uint32_t required = 0u, flushed = 0u;
+	std::memcpy(&required, data.data() + t, sizeof(required));
+	t += sizeof(required);
+	std::memcpy(&flushed, data.data() + t, sizeof(flushed));
+	t += sizeof(flushed);
+	uint64_t bitbltbuf = 0u, trxpos = 0u, trxreg = 0u, trxdir = 0u;
+	std::memcpy(&bitbltbuf, data.data() + t, sizeof(bitbltbuf));
+	t += sizeof(bitbltbuf);
+	std::memcpy(&trxpos, data.data() + t, sizeof(trxpos));
+	t += sizeof(trxpos);
+	std::memcpy(&trxreg, data.data() + t, sizeof(trxreg));
+	t += sizeof(trxreg);
+	std::memcpy(&trxdir, data.data() + t, sizeof(trxdir));
+	t += sizeof(trxdir);
+	const uint8_t shadow = data[t++];
+	if (shadow > 1u)
+		return false;
+	uint64_t payloadQwords = 0u;
+	std::memcpy(&payloadQwords, data.data() + t, sizeof(payloadQwords));
+	t += sizeof(payloadQwords);
+	if (payloadQwords > kMaxPayloadQwords)
+		return false;
+	if (data.size() - t < size_t(payloadQwords) * sizeof(uint64_t) + sizeof(uint64_t))
+		return false;
+	const size_t payloadOff = t;
+	t += size_t(payloadQwords) * sizeof(uint64_t);
+	uint64_t fifoBytes = 0u;
+	std::memcpy(&fifoBytes, data.data() + t, sizeof(fifoBytes));
+	t += sizeof(fifoBytes);
+	if (fifoBytes > kMaxFifoBytes || fifoBytes % 16u != 0u)
+		return false;
+	if (data.size() - t != size_t(fifoBytes) + 2u * sizeof(uint32_t))
+		return false;
+	const size_t fifoOff = t;
+	t += size_t(fifoBytes);
+	uint32_t fifoReadOff = 0u, fifoSize = 0u;
+	std::memcpy(&fifoReadOff, data.data() + t, sizeof(fifoReadOff));
+	t += sizeof(fifoReadOff);
+	std::memcpy(&fifoSize, data.data() + t, sizeof(fifoSize));
+	if (uint64_t(fifoSize) * 16u != fifoBytes || fifoReadOff > fifoSize)
+		return false;
+	transfer_state.host_to_local_active = active != 0u;
+	transfer_state.required_qwords = required;
+	transfer_state.last_flushed_qwords = flushed;
+	transfer_state.copy.bitbltbuf.bits = bitbltbuf;
+	transfer_state.copy.trxpos.bits = trxpos;
+	transfer_state.copy.trxreg.bits = trxreg;
+	transfer_state.copy.trxdir.bits = trxdir;
+	transfer_state.copy.needs_shadow_vram = shadow != 0u;
+	transfer_state.host_to_local_payload.assign(
+		reinterpret_cast<const uint64_t *>(data.data() + payloadOff),
+		reinterpret_cast<const uint64_t *>(data.data() + payloadOff) + size_t(payloadQwords));
+	transfer_state.copy.host_data = transfer_state.host_to_local_payload.data();
+	transfer_state.copy.host_data_size = size_t(payloadQwords) * sizeof(uint64_t);
+	transfer_state.copy.host_data_size_offset = size_t(flushed) * sizeof(uint64_t);
+	transfer_state.copy.host_data_size_required = size_t(required) * sizeof(uint64_t);
+	transfer_state.fifo_readback.reserve(size_t(fifoBytes));
+	if (fifoBytes)
+		std::memcpy(transfer_state.fifo_readback.data(), data.data() + fifoOff, size_t(fifoBytes));
+	transfer_state.fifo_readback_128b_offset = fifoReadOff;
+	transfer_state.fifo_readback_128b_size = fifoSize;
 	return true;
 }
 
